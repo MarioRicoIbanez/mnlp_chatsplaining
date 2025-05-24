@@ -136,6 +136,7 @@ Explanation: {}"""
         reasoning_dataset_name: str,
         non_reasoning_dataset_name: str = "mlabonne/FineTome-100k",
         max_samples: int = None,
+        split: str = "train",
         is_mcqa: bool = False,
     ):
         """Prepare training datasets."""
@@ -182,6 +183,8 @@ Explanation: {}"""
         self.train_dataset = reasoning_dataset
         logger.info(f"Dataset prepared with {len(self.train_dataset)} examples")
         logger.info(f"Sample: {self.train_dataset[0]}")
+
+        return reasoning_dataset
     
     def setup_lora(
         self,

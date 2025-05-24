@@ -85,7 +85,7 @@ def main():
     )
     
     # Prepare dataset (assuming MCQA format for the provided dataset)
-    trainer.prepare_datasets(
+    _ =trainer.prepare_datasets(
         reasoning_dataset_name=args.reasoning_dataset,
         max_samples=args.max_samples,
         is_mcqa=True,  # Set to True for MCQA datasets like sciq_treated_epfl_mcqa
@@ -110,6 +110,8 @@ def main():
     
     print("✅ Training completed successfully!")
     print(f"📊 Training stats: {trainer_stats}")
+
+     
 
 if __name__ == "__main__":
     main() 
