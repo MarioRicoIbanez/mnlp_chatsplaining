@@ -56,7 +56,7 @@ def main():
         output_dir=str(SCRIPT_DIR / "qwen_sft_demo"),
         overwrite_output_dir=True,
         num_train_epochs=1,
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=6,
         gradient_accumulation_steps=1,
         logging_steps=20,
         save_steps=0,
