@@ -10,7 +10,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train and fine-tune language models using LoRA")
     
     # Model configuration
-    parser.add_argument("--model_name", type=str, default="unsloth/Qwen3-14B",
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen1.5-1.8B",
                       help="Name of the base model to use")
     parser.add_argument("--max_seq_length", type=int, default=2048,
                       help="Maximum sequence length")
@@ -28,7 +28,7 @@ def parse_args():
                       help="LoRA dropout")
     
     # Dataset configuration
-    parser.add_argument("--reasoning_dataset", type=str, default="unsloth/OpenMathReasoning-mini",
+    parser.add_argument("--reasoning_dataset", type=str, default="Open-Orca/OpenMathReasoning-10k",
                       help="Name of the reasoning dataset")
     parser.add_argument("--non_reasoning_dataset", type=str, default="mlabonne/FineTome-100k",
                       help="Name of the non-reasoning dataset")
@@ -85,7 +85,7 @@ def main():
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        use_gradient_checkpointing="unsloth"
+        use_gradient_checkpointing=True
     )
     
     # Prepare datasets
@@ -118,13 +118,27 @@ def main():
         {"role": "user", "content": "What is the capital of France?"}
     ]
     
+    # Generate with thinking mode enabled
     response = trainer.generate(
         messages=messages,
         max_new_tokens=256,
-        temperature=0.7
+        temperature=0.7,
+        enable_thinking=True
     )
     
-    logger.info(f"Model response: {response}")
+    if response["thinking"]:
+        logger.info(f"Model thinking: {response['thinking']}")
+    logger.info(f"Model response: {response['response']}")
+    
+    # Example with thinking mode disabled
+    response_no_thinking = trainer.generate(
+        messages=messages,
+        max_new_tokens=256,
+        temperature=0.7,
+        enable_thinking=False
+    )
+    
+    logger.info(f"Model response (no thinking): {response_no_thinking['response']}")
 
 if __name__ == "__main__":
     main() 
