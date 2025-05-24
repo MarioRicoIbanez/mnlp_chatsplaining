@@ -137,21 +137,12 @@ Explanation: {}"""
         non_reasoning_dataset_name: str = "mlabonne/FineTome-100k",
         max_samples: int = None,
         is_mcqa: bool = False,
-        include_eval: bool = False,
     ):
         """Prepare training datasets."""
         logger.info(f"Loading reasoning dataset: {reasoning_dataset_name}")
         
         # Load reasoning dataset
-        try:
-            # Try to load the entire dataset first to see available splits
-            full_dataset = load_dataset(reasoning_dataset_name)
-            logger.info(f"Available splits: {list(full_dataset.keys())}")
-            
-            reasoning_dataset = load_dataset(reasoning_dataset_name, split="train")
-        except Exception as e:
-            logger.warning(f"Could not load full dataset info: {e}")
-            reasoning_dataset = load_dataset(reasoning_dataset_name, split="train")
+        reasoning_dataset = load_dataset(reasoning_dataset_name, split="train")
         
         if max_samples and len(reasoning_dataset) > max_samples:
             reasoning_dataset = reasoning_dataset.select(range(max_samples))
@@ -189,37 +180,7 @@ Explanation: {}"""
             reasoning_dataset = reasoning_dataset.map(format_conversations)
         
         self.train_dataset = reasoning_dataset
-        
-        # Load evaluation dataset if requested
-        self.eval_dataset = None
-        if include_eval:
-            try:
-                logger.info("Loading evaluation dataset...")
-                eval_dataset = load_dataset(reasoning_dataset_name, split="validation")
-                
-                if max_samples and len(eval_dataset) > max_samples // 4:  # Use 1/4 of max_samples for eval
-                    eval_dataset = eval_dataset.select(range(max_samples // 4))
-                    logger.info(f"Limited eval dataset to {max_samples // 4} samples")
-                
-                if is_mcqa:
-                    eval_dataset = eval_dataset.map(
-                        self._convert_mcqa_to_chat,
-                        batched=True,
-                        remove_columns=eval_dataset.column_names
-                    )
-                else:
-                    eval_dataset = eval_dataset.map(format_conversations)
-                
-                self.eval_dataset = eval_dataset
-                logger.info(f"Loaded {len(self.eval_dataset)} evaluation examples")
-                
-            except Exception as e:
-                logger.warning(f"Could not load evaluation dataset: {e}")
-                self.eval_dataset = None
-        
-        logger.info(f"Dataset prepared with {len(self.train_dataset)} training examples")
-        if self.eval_dataset:
-            logger.info(f"Evaluation dataset prepared with {len(self.eval_dataset)} examples")
+        logger.info(f"Dataset prepared with {len(self.train_dataset)} examples")
         logger.info(f"Sample: {self.train_dataset[0]}")
     
     def setup_lora(
@@ -257,8 +218,6 @@ Explanation: {}"""
         num_train_epochs: int = 1,
         learning_rate: float = 2e-4,
         logging_steps: float = 0.2,
-        eval_steps: float = None,
-        save_steps: float = None,
     ):
         """Train the model."""
         # Data collator
@@ -267,32 +226,21 @@ Explanation: {}"""
             mlm=False
         )
         
-        # Set eval_steps if we have eval dataset
-        if self.eval_dataset and eval_steps is None:
-            eval_steps = max(1, int(len(self.train_dataset) // (per_device_train_batch_size * gradient_accumulation_steps) * 0.5))
-        
         # Training arguments
         training_arguments = TrainingArguments(
             output_dir=self.output_dir,
             per_device_train_batch_size=per_device_train_batch_size,
-            per_device_eval_batch_size=per_device_train_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=warmup_steps,
             num_train_epochs=num_train_epochs,
             learning_rate=learning_rate,
             logging_steps=logging_steps,
-            eval_steps=eval_steps,
-            save_steps=save_steps,
-            evaluation_strategy="steps" if self.eval_dataset else "no",
-            save_strategy="steps" if save_steps else "epoch",
             optim="paged_adamw_32bit",
             logging_strategy="steps",
             fp16=False,
             bf16=False,
             group_by_length=True,
             report_to="none",
-            load_best_model_at_end=True if self.eval_dataset else False,
-            metric_for_best_model="eval_loss" if self.eval_dataset else None,
         )
         
         # Initialize trainer
@@ -300,7 +248,6 @@ Explanation: {}"""
             model=self.model,
             args=training_arguments,
             train_dataset=self.train_dataset,
-            eval_dataset=self.eval_dataset,
             data_collator=data_collator,
         )
         
@@ -311,17 +258,7 @@ Explanation: {}"""
         self.model.config.use_cache = False
         
         logger.info("Starting training...")
-        if self.eval_dataset:
-            logger.info(f"Will evaluate every {eval_steps} steps")
-        
         trainer_stats = trainer.train()
-        
-        # Final evaluation if we have eval dataset
-        if self.eval_dataset:
-            logger.info("Running final evaluation...")
-            eval_results = trainer.evaluate()
-            logger.info(f"Final evaluation results: {eval_results}")
-        
         logger.info("Training completed!")
         
         return trainer_stats
