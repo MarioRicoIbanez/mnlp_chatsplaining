@@ -1,6 +1,9 @@
-from datasets import load_dataset
+from datasets import load_dataset, Dataset, DatasetDict
 from typing import List, Dict, Tuple
 from .base_processor import BaseDatasetProcessor
+import logging
+
+logger = logging.getLogger(__name__)
 
 class SciQProcessor(BaseDatasetProcessor):
     """Processor for the SciQ dataset."""
@@ -82,10 +85,58 @@ class SciQProcessor(BaseDatasetProcessor):
             "source": "sciq",
             "explanation": item["support"]
         }
+    
+    def push_to_hub(self, repo_name: str = "RikoteMaster/sciq_treated_epfl_mcqa", token: str = None):
+        """
+        Process the dataset and push all splits (train, validation, test) to Hugging Face Hub.
+        
+        Args:
+            repo_name (str): The Hugging Face repository name
+            token (str, optional): Hugging Face token for authentication
+        """
+        logger.info("Processing SciQ dataset for all splits...")
+        
+        # Process the dataset
+        train_data, val_data, test_data = self.process_dataset()
+        
+        logger.info(f"Processed {len(train_data)} training examples")
+        logger.info(f"Processed {len(val_data)} validation examples") 
+        logger.info(f"Processed {len(test_data)} test examples")
+        
+        # Create datasets
+        train_dataset = Dataset.from_list(train_data)
+        val_dataset = Dataset.from_list(val_data)
+        test_dataset = Dataset.from_list(test_data)
+        
+        # Create DatasetDict
+        dataset_dict = DatasetDict({
+            "train": train_dataset,
+            "validation": val_dataset,
+            "test": test_dataset
+        })
+        
+        # Push to hub
+        logger.info(f"Pushing dataset to {repo_name}...")
+        dataset_dict.push_to_hub(
+            repo_name,
+            token=token,
+            commit_message="Add validation and test splits from allenai/sciq"
+        )
+        
+        logger.info("✅ Successfully pushed all splits to Hugging Face Hub!")
+        logger.info(f"✅ Repository: {repo_name}")
+        logger.info(f"✅ Train examples: {len(train_data)}")
+        logger.info(f"✅ Validation examples: {len(val_data)}")
+        logger.info(f"✅ Test examples: {len(test_data)}")
 
 def main():
     processor = SciQProcessor()
+    
+    # Option 1: Save locally
     processor.process_and_save()
+    
+    # Option 2: Push to Hugging Face Hub (uncomment and provide token)
+    # processor.push_to_hub(token="your_hf_token_here")
 
 if __name__ == "__main__":
     main() 
