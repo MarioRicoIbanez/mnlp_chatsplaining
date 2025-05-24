@@ -1,117 +1,165 @@
-import argparse
-from training.trainer import ModelTrainer
+# Standard library imports
 import logging
+import os
+from pathlib import Path
+import torch
 
-logging.basicConfig(level=logging.INFO)
+# Third-party imports
+from datasets import load_dataset
+from transformers import TrainingArguments, Trainer
+
+# Local imports
+from utils.dataset_utils import process_mcq_dataset, tokenize_func, SFTDataCollator
+from utils.model_utils import load_model
+from utils.train_utils import plot_training_loss
+
+# Get the directory where this script is located
+SCRIPT_DIR = Path(__file__).parent.absolute()
+FIGS_DIR = SCRIPT_DIR / "figs"
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Fine-tune Qwen models using simplified approach")
-    
-    # Model configuration
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B",
-                      help="Name of the base model to use")
-    parser.add_argument("--max_seq_length", type=int, default=2048,
-                      help="Maximum sequence length")
-    parser.add_argument("--load_in_4bit", action="store_true", default=True,
-                      help="Load model in 4-bit precision")
-    
-    # LoRA configuration
-    parser.add_argument("--lora_r", type=int, default=64,
-                      help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=16,
-                      help="LoRA alpha parameter")
-    parser.add_argument("--lora_dropout", type=float, default=0.05,
-                      help="LoRA dropout")
-    
-    # Dataset configuration
-    parser.add_argument("--reasoning_dataset", type=str, required=True,
-                      help="Name of the reasoning dataset")
-    parser.add_argument("--max_samples", type=int, default=100,
-                      help="Maximum number of samples to load")
-    parser.add_argument("--is_mcqa", action="store_true", default=True,
-                      help="Whether the dataset is in MCQA format")
-    
-    # Training configuration
-    parser.add_argument("--batch_size", type=int, default=1,
-                      help="Training batch size per device")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=2,
-                      help="Number of gradient accumulation steps")
-    parser.add_argument("--warmup_steps", type=int, default=10,
-                      help="Number of warmup steps")
-    parser.add_argument("--num_train_epochs", type=int, default=1,
-                      help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=2e-4,
-                      help="Learning rate")
-    parser.add_argument("--logging_steps", type=float, default=0.2,
-                      help="Logging frequency")
-    
-    # Output configuration
-    parser.add_argument("--output_dir", type=str, default="output",
-                      help="Directory to save model outputs")
-    parser.add_argument("--model_save_name", type=str, default="qwen3-finetuned",
-                      help="Name for the saved model")
-    parser.add_argument("--push_to_hub", action="store_true", default=False,
-                      help="Push model to Hugging Face Hub")
-    
-    # Hugging Face configuration
-    parser.add_argument("--hf_token", type=str, default=None,
-                      help="Hugging Face token")
-    
-    return parser.parse_args()
-
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune Qwen model")
-    parser.add_argument("--reasoning_dataset", type=str, required=True,
-                       help="Name of the reasoning dataset to use")
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B",
-                       help="Model name to use")
-    parser.add_argument("--max_samples", type=int, default=100,
-                       help="Maximum number of samples to use")
-    parser.add_argument("--output_dir", type=str, default="./output",
-                       help="Output directory for the model")
+    logger.info("Starting training process...")
     
-    args = parser.parse_args()
-    
-    print(f"🚀 Starting training with:")
-    print(f"   Model: {args.model_name}")
-    print(f"   Dataset: {args.reasoning_dataset}")
-    print(f"   Max samples: {args.max_samples}")
-    
-    # Initialize trainer
-    trainer = ModelTrainer(
-        model_name=args.model_name,
-        output_dir=args.output_dir,
-    )
-    
-    # Prepare dataset (assuming MCQA format for the provided dataset)
-    _ =trainer.prepare_datasets(
-        reasoning_dataset_name=args.reasoning_dataset,
-        max_samples=args.max_samples,
-        is_mcqa=True,  # Set to True for MCQA datasets like sciq_treated_epfl_mcqa
-    )
-    
-    # Setup LoRA
-    trainer.setup_lora()
-    
-    # Train the model
-    print("🔥 Starting training...")
-    trainer_stats = trainer.train(
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=2,
-        warmup_steps=5,
-        num_train_epochs=1,
-        learning_rate=2e-4,
-        logging_steps=0.1,  # Log more frequently for small datasets
-    )
-    
-    # Save the model
-    trainer.save_model("qwen3-finetuned")
-    
-    print("✅ Training completed successfully!")
-    print(f"📊 Training stats: {trainer_stats}")
+    # 1. Model and Tokenizer Setup
+    logger.info("Loading model and tokenizer...")
+    model, tokenizer = load_model(model_name="Qwen/Qwen3-0.6B", load_in_4bit=False)
+    logger.info("Model and tokenizer loaded successfully")
 
-     
+    # 2. Dataset Preparation
+    logger.info("Loading dataset from HuggingFace...")
+    train_dataset = load_dataset("RikoteMaster/sciq_treated_epfl_mcqa", split="train")
+    logger.info(f"Dataset loaded with {len(train_dataset)} examples")
+    
+    if "choices" in train_dataset.column_names:
+        # logger.info("Selecting first 100 examples for DEBUGGING...")
+        # train_dataset = train_dataset.select(range(100))
+        train_dataset = train_dataset.map(process_mcq_dataset, fn_kwargs={"tokenizer": tokenizer})
+
+    tokenized_dataset = train_dataset.map(
+        tokenize_func, 
+        fn_kwargs={"tokenizer": tokenizer}, 
+        remove_columns=train_dataset.column_names
+    )
+
+    # 3. Training Setup
+    data_collator = SFTDataCollator(tokenizer=tokenizer)
+
+    training_args = TrainingArguments(
+        output_dir=str(SCRIPT_DIR / "qwen_sft_demo"),
+        overwrite_output_dir=True,
+        num_train_epochs=1,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=1,
+        logging_steps=20,
+        save_steps=0,
+        report_to=[],
+        bf16=True,
+        disable_tqdm=False,
+        remove_unused_columns=False,
+    )
+
+    trainer = Trainer(
+        model=model,
+        train_dataset=tokenized_dataset,
+        data_collator=data_collator,
+        args=training_args,
+    )
+    logger.info("Trainer initialized successfully")
+
+    # 4. Training
+    trainer.train()
+
+    # 5. Plotting and Saving Results
+    logger.info("Generating and saving training loss plot...")
+    plot_training_loss(trainer, FIGS_DIR)
+    logger.info("Training loss plot saved successfully")
+
+    # 6. Evaluation on test dataset
+    logger.info("Loading test dataset for evaluation...")
+    test_dataset = load_dataset("RikoteMaster/sciq_treated_epfl_mcqa", split="test")
+    logger.info(f"Test dataset loaded with {len(test_dataset)} examples")
+    
+    # Process first 10 test samples for evaluation
+    logger.info("Evaluating model on first 10 test samples...")
+    test_samples = test_dataset.select(range(10))
+    processed_test_samples = test_samples.map(process_mcq_dataset, fn_kwargs={"tokenizer": tokenizer})
+    
+    print("\n" + "="*80)
+    print("EVALUATION: Model predictions vs Ground Truth")
+    print("="*80)
+    
+    correct_predictions = 0
+    total_predictions = 0
+    
+    for i, sample in enumerate(processed_test_samples):
+        print(f"\n--- SAMPLE {i+1} ---")
+        print(f"Question: {sample.get('question', 'N/A')}")
+        print(f"Choices: {sample.get('choices', 'N/A')}")
+        print(f"Ground Truth Answer: {sample.get('answer_text', 'N/A')}")
+        
+        # Use only the prompt (without the answer) for generation
+        prompt_only = sample['prompt']
+        
+        # Tokenize and generate
+        inputs = tokenizer(prompt_only, return_tensors="pt").to(model.device)
+        
+        # Generate response
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs, 
+                max_new_tokens=200,
+                do_sample=True,
+                temperature=0.7,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        # Decode only the generated part (excluding the input prompt)
+        generated_text = tokenizer.decode(
+            output_ids[0][inputs['input_ids'].shape[1]:], 
+            skip_special_tokens=True
+        ).strip()
+        
+        print(f"\nModel Generated:")
+        print(f"'{generated_text}'")
+        
+        # Simple evaluation: check if the correct answer letter appears in generated text
+        ground_truth = sample.get('answer_text', '')
+        choices = sample.get('choices', [])
+        
+        if isinstance(choices, list) and ground_truth in choices:
+            correct_answer_index = choices.index(ground_truth)
+            correct_letter = chr(65 + correct_answer_index)  # A, B, C, D
+            
+            # Check if the correct letter appears in the generated response
+            is_correct = correct_letter in generated_text.upper()
+            correct_predictions += int(is_correct)
+            total_predictions += 1
+            
+            print(f"Expected Answer: {correct_letter}. {ground_truth}")
+            print(f"Prediction: {'✓ CORRECT' if is_correct else '✗ INCORRECT'}")
+        else:
+            print(f"Could not evaluate this sample")
+        
+        print("-" * 60)
+    
+    # Print overall accuracy
+    if total_predictions > 0:
+        accuracy = correct_predictions / total_predictions * 100
+        print(f"\nOVERALL ACCURACY: {correct_predictions}/{total_predictions} = {accuracy:.1f}%")
+    else:
+        print(f"\nCould not compute accuracy")
 
 if __name__ == "__main__":
-    main() 
+    main()
+
+
+
+

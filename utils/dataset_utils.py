@@ -1,0 +1,141 @@
+"""Dataset utilities to convert MCQ rows into ChatML prompts for Qwen‑3.
+
+This version uses **Jinja 2** to build the prompt so the structure is
+clear and easily editable.  It follows the ChatML format we discussed,
+including the `<think>` block for chain‑of‑thought.
+"""
+
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, List, Sequence
+
+from jinja2 import Template
+
+import torch
+from torch.nn.utils.rnn import pad_sequence
+
+
+# ---------------------------------------------------------------------------
+# Jinja template blocks
+# ---------------------------------------------------------------------------
+
+_SYSTEM_BLOCK = (
+    "<|im_start|>system\n"
+    "You are a helpful assistant specialised in master‑level STEM.\n"
+    "<|im_end|>\n"
+)
+
+_USER_TMPL = Template(
+    """<|im_start|>user
+The following is a multiple choice question (with answers) about knowledge and skills in advanced master‑level STEM courses.
+
+Question: {{ question }}
+Choices:
+{{ choices_block }}
+<|im_end|>
+""",
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+
+_ASSISTANT_START = "<|im_start|>assistant\n"
+
+_ASSISTANT_BODY_TMPL = Template(
+    """<think>
+{{ explanation }}
+</think>
+Answer: {{ answer_text }}""",
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+
+_ASSISTANT_END = "\n<|im_end|>"
+
+# ---------------------------------------------------------------------------
+# Public helpers
+# ---------------------------------------------------------------------------
+
+def build_prompt_section(question: str, choices_block: str) -> str:
+    """Return the system + user blocks ready for concatenation."""
+    return _SYSTEM_BLOCK + _USER_TMPL.render(question=question, choices_block=choices_block)
+
+
+def process_mcq_dataset(
+    row: Dict[str, str | Sequence[str]],
+    *,
+    tokenizer=None,
+) -> Dict[str, str | int | None]:
+    """Convert one *row* into the structure required by the training pipeline.
+
+    Parameters
+    ----------
+    row : dict
+        Must contain ``question``, ``choices``, ``explanation`` and ``answer_text``.
+    tokenizer : Pre‑trained tokenizer (optional)
+        If supplied, we compute ``prompt_len`` (number of tokens in *prompt*)
+        so the collator can create an attention mask faster.
+
+    Returns
+    -------
+    dict
+        ``{"prompt", "full_text", "prompt_len", "text"}``
+    """
+
+    # --- 1. Choices block ---------------------------------------------------
+    choices_val = row["choices"]
+    if isinstance(choices_val, (list, tuple)):
+        choices_block = "\n".join(f"{chr(65 + i)}. {opt}" for i, opt in enumerate(choices_val))
+    else:
+        choices_block = str(choices_val)
+
+    # --- 2. Prompt (system+user+assistant header) ---------------------------
+    prompt = build_prompt_section(row["question"], choices_block) + _ASSISTANT_START
+
+    # --- 3. Assistant body --------------------------------------------------
+    assistant_body = _ASSISTANT_BODY_TMPL.render(
+        explanation=row["explanation"],
+        answer_text=row["answer_text"],
+    )
+
+    # --- 4. Full text -------------------------------------------------------
+    full_text = prompt + assistant_body + _ASSISTANT_END
+
+    # --- 5. Prompt length (optional) ---------------------------------------
+    if tokenizer is not None:
+        prompt_len = len(tokenizer(prompt)["input_ids"])
+    else:
+        prompt_len = None
+
+    return {
+        "prompt": prompt,
+        "full_text": full_text,
+        "prompt_len": prompt_len,      # 
+    }
+
+
+def tokenize_func(ex, tokenizer):
+    tok = tokenizer(ex["full_text"], truncation=True)
+    tok["prompt_len"] = ex["prompt_len"]          # keep for masking later
+    return tok
+
+
+
+class SFTDataCollator:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, batch):
+        # Convert list of tokenized samples to padded tensor batch
+        input_ids_list = [torch.tensor(b["input_ids"]) for b in batch]
+        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        # Attention mask: 1 for real tokens, 0 for pad
+        attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+        # Create labels (copy of input_ids)
+        labels = input_ids.clone()
+        # Mask out prompt part
+        for i, b in enumerate(batch):
+            prompt_len = b["prompt_len"]  # length of prompt in tokens
+            labels[i, :prompt_len] = -100  # ignore prompt tokens in loss
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels} 

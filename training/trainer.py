@@ -131,61 +131,8 @@ Explanation: {}"""
         
         return {"text": texts}
     
-    def prepare_datasets(
-        self,
-        reasoning_dataset_name: str,
-        non_reasoning_dataset_name: str = "mlabonne/FineTome-100k",
-        max_samples: int = None,
-        split: str = "train",
-        is_mcqa: bool = False,
-    ):
-        """Prepare training datasets."""
-        logger.info(f"Loading reasoning dataset: {reasoning_dataset_name}")
-        
-        # Load reasoning dataset
-        reasoning_dataset = load_dataset(reasoning_dataset_name, split="train")
-        
-        if max_samples and len(reasoning_dataset) > max_samples:
-            reasoning_dataset = reasoning_dataset.select(range(max_samples))
-            logger.info(f"Limited dataset to {max_samples} samples")
-        
-        # Convert MCQA format if needed
-        if is_mcqa:
-            logger.info("Converting MCQA to text format...")
-            reasoning_dataset = reasoning_dataset.map(
-                self._convert_mcqa_to_chat,
-                batched=True,
-                remove_columns=reasoning_dataset.column_names
-            )
-        else:
-            # Simple text formatting for non-MCQA datasets
-            def format_conversations(example):
-                if "conversations" in example:
-                    messages = example["conversations"]
-                elif "messages" in example:
-                    messages = example["messages"]
-                else:
-                    return {"text": "Hello"}
-                
-                text = ""
-                for msg in messages:
-                    role = msg.get("role", "user")
-                    content = msg.get("content", "")
-                    text += f"{role}: {content}\n"
-                
-                if not text.endswith(self.EOS_TOKEN):
-                    text += self.EOS_TOKEN
-                    
-                return {"text": text}
-            
-            reasoning_dataset = reasoning_dataset.map(format_conversations)
-        
-        self.train_dataset = reasoning_dataset
-        logger.info(f"Dataset prepared with {len(self.train_dataset)} examples")
-        logger.info(f"Sample: {self.train_dataset[0]}")
-
-        return reasoning_dataset
-    
+%load_ext autoreload
+%autoreload 2
     def setup_lora(
         self,
         r: int = 64,

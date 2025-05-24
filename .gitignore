@@ -1,0 +1,10 @@
+qwen_sft_demo/
+figs/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+*.pyzwz
