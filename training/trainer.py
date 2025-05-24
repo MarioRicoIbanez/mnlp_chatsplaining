@@ -170,9 +170,10 @@ class ModelTrainer:
                 batched=True,
                 remove_columns=reasoning_dataset.column_names
             )
-        
-        # Get conversations from reasoning dataset
-        reasoning_conversations = reasoning_dataset["conversations"]
+            reasoning_conversations = reasoning_dataset["conversations"]
+        else:
+            # For non-MCQA datasets, assume they're already in chat format
+            reasoning_conversations = reasoning_dataset["conversations"]
         
         # Load non-reasoning dataset
         non_reasoning_dataset = load_dataset(non_reasoning_dataset_name, split="train")

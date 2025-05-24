@@ -92,7 +92,8 @@ def main():
     trainer.prepare_datasets(
         reasoning_dataset_name=args.reasoning_dataset,
         non_reasoning_dataset_name=args.non_reasoning_dataset,
-        chat_percentage=args.chat_percentage
+        chat_percentage=args.chat_percentage,
+        is_mcqa=True  # Indicate we're using MCQA format
     )
     
     # Train the model
