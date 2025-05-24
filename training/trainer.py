@@ -1,5 +1,5 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
-from peft import LoraConfig, get_peft_model, PeftModel, PeftConfig
+from peft import LoraConfig, get_peft_model
 from datasets import load_dataset, Dataset
 import pandas as pd
 from trl import SFTTrainer, SFTConfig
@@ -108,12 +108,47 @@ class ModelTrainer:
         if use_gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
     
+    def _convert_mcqa_to_chat(self, examples):
+        """
+        Convert MCQA format to chat format matching the evaluation format and Qwen3's thinking mode.
+        
+        Args:
+            examples: Dictionary containing MCQA fields
+            
+        Returns:
+            Dict with chat format
+        """
+        questions = examples["question"]
+        choices = examples["choices"]
+        answers = examples["answer_text"]
+        explanations = examples["explanation"]
+        
+        conversations = []
+        for question, choice_list, answer, explanation in zip(questions, choices, answers, explanations):
+            # Create the question with choices in the same format as evaluation
+            question_text = f"The following are multiple choice questions (with answers) about knowledge and skills in advanced master-level STEM courses.\n\n"
+            question_text += f"{question}\n"
+            # Use letters A-Z for choices, matching the number of choices provided
+            question_text += "".join([f"{chr(65+i)}. {choice}\n" for i, choice in enumerate(choice_list)])
+            question_text += "Answer:"
+            
+            # Create the answer with explanation in Qwen3's thinking mode format
+            answer_text = f"<think>Let me analyze this step by step:\n1. First, I'll read the question carefully\n2. Then, I'll evaluate each option\n3. Finally, I'll explain my reasoning\n\n{explanation}</think>\n{answer}"
+            
+            conversations.append([
+                {"role": "user", "content": question_text},
+                {"role": "assistant", "content": answer_text}
+            ])
+        
+        return {"conversations": conversations}
+    
     def prepare_datasets(
         self,
         reasoning_dataset_name: str = "Open-Orca/OpenMathReasoning-10k",
         non_reasoning_dataset_name: str = "mlabonne/FineTome-100k",
         chat_percentage: float = 0.75,
         seed: int = 3407,
+        is_mcqa: bool = False,
     ):
         """
         Prepare training datasets.
@@ -123,25 +158,31 @@ class ModelTrainer:
             non_reasoning_dataset_name (str): Name of the non-reasoning dataset
             chat_percentage (float): Percentage of chat data to use
             seed (int): Random seed
+            is_mcqa (bool): Whether the dataset is in MCQA format
         """
+        # Load reasoning dataset
         reasoning_dataset = load_dataset(reasoning_dataset_name, split="train")
+        
+        # Convert MCQA format to chat if needed
+        if is_mcqa:
+            reasoning_dataset = reasoning_dataset.map(
+                self._convert_mcqa_to_chat,
+                batched=True,
+                remove_columns=reasoning_dataset.column_names
+            )
+        
+        # Get conversations from reasoning dataset
+        reasoning_conversations = reasoning_dataset["conversations"]
+        
+        # Load non-reasoning dataset
         non_reasoning_dataset = load_dataset(non_reasoning_dataset_name, split="train")
         
-        def generate_conversation(examples):
-            problems = examples["problem"]
-            solutions = examples["generated_solution"]
-            conversations = []
-            for problem, solution in zip(problems, solutions):
-                conversations.append([
-                    {"role": "user", "content": problem},
-                    {"role": "assistant", "content": solution},
-                ])
-            return {"conversations": conversations}
-        
-        reasoning_conversations = reasoning_dataset.map(generate_conversation, batched=True)["conversations"]
-        
-        # For non-reasoning, assume already in ShareGPT format or similar
-        non_reasoning_conversations = non_reasoning_dataset["conversations"] if "conversations" in non_reasoning_dataset.features else non_reasoning_dataset["text"]
+        # Get conversations from non-reasoning dataset
+        if "conversations" in non_reasoning_dataset.features:
+            non_reasoning_conversations = non_reasoning_dataset["conversations"]
+        else:
+            # Assume it's in text format and needs conversion
+            non_reasoning_conversations = non_reasoning_dataset["text"]
         
         # Sample and combine datasets
         non_reasoning_subset = pd.Series(non_reasoning_conversations)
