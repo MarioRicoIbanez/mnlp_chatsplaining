@@ -28,10 +28,10 @@ class BaseDatasetProcessor(ABC):
     @abstractmethod
     def process_dataset(self) -> Tuple[List[Dict], List[Dict], List[Dict]]:
         """
-        Process the dataset into chat format.
+        Process the dataset into MCQA format.
         
         Returns:
-            Tuple[List[Dict], List[Dict], List[Dict]]: Training, validation, and test data in chat format
+            Tuple[List[Dict], List[Dict], List[Dict]]: Training, validation, and test data in MCQA format
         """
         pass
     
@@ -48,46 +48,42 @@ class BaseDatasetProcessor(ABC):
             json.dump(data, f, indent=2, ensure_ascii=False)
         logger.info(f"Saved {len(data)} examples to {output_path}")
     
-    def validate_chat_format(self, data: List[Dict]) -> bool:
+    def validate_mcqa_format(self, data: List[Dict]) -> bool:
         """
-        Validate that the data follows the chat format required for training.
+        Validate that the data follows the MCQA format required for training.
         
         Required format for each item:
         {
-            "conversations": [
-                {"role": "user", "content": str},
-                {"role": "assistant", "content": str}
-            ]
+            "question": str,
+            "choices": List[str],  # Must be exactly 4 choices
+            "answer_index": int,   # Index of correct answer (0-3)
+            "answer_text": str,    # Text of correct answer
+            "source": str,         # Source of the question
+            "explanation": str     # Explanation for the answer
         }
         """
+        required_fields = {"question", "choices", "answer_index", "answer_text", "source", "explanation"}
+        
         for item in data:
-            # Check if conversations field exists
-            if "conversations" not in item:
-                logger.error(f"Missing 'conversations' field in item: {item}")
+            # Check all required fields are present
+            if not all(field in item for field in required_fields):
+                logger.error(f"Missing required fields in item: {item}")
                 return False
             
-            # Check if conversations is a list
-            if not isinstance(item["conversations"], list):
-                logger.error(f"'conversations' must be a list: {item['conversations']}")
+            # Check choices is a list of exactly 4 items
+            if not isinstance(item["choices"], list) or len(item["choices"]) != 4:
+                logger.error(f"Choices must be a list of exactly 4 items: {item['choices']}")
                 return False
             
-            # Check each conversation turn
-            for turn in item["conversations"]:
-                if not isinstance(turn, dict):
-                    logger.error(f"Conversation turn must be a dictionary: {turn}")
-                    return False
-                
-                if "role" not in turn or "content" not in turn:
-                    logger.error(f"Missing 'role' or 'content' in turn: {turn}")
-                    return False
-                
-                if turn["role"] not in ["user", "assistant"]:
-                    logger.error(f"Invalid role in turn: {turn['role']}")
-                    return False
-                
-                if not isinstance(turn["content"], str):
-                    logger.error(f"Content must be a string: {turn['content']}")
-                    return False
+            # Check answer_index is valid
+            if not isinstance(item["answer_index"], int) or item["answer_index"] not in range(4):
+                logger.error(f"answer_index must be an integer between 0 and 3: {item['answer_index']}")
+                return False
+            
+            # Check answer_text matches the choice at answer_index
+            if item["answer_text"] != item["choices"][item["answer_index"]]:
+                logger.error(f"answer_text does not match the choice at answer_index: {item}")
+                return False
         
         return True
     
@@ -115,16 +111,16 @@ class BaseDatasetProcessor(ABC):
         """
         train_data, val_data, test_data = self.process_dataset()
         
-        if not self.validate_chat_format(train_data):
-            raise ValueError("Training data does not follow the required chat format")
-        if not self.validate_chat_format(val_data):
-            raise ValueError("Validation data does not follow the required chat format")
-        if not self.validate_chat_format(test_data):
-            raise ValueError("Test data does not follow the required chat format")
+        if not self.validate_mcqa_format(train_data):
+            raise ValueError("Training data does not follow the required MCQA format")
+        if not self.validate_mcqa_format(val_data):
+            raise ValueError("Validation data does not follow the required MCQA format")
+        if not self.validate_mcqa_format(test_data):
+            raise ValueError("Test data does not follow the required MCQA format")
         
-        self.save_to_json(train_data, "chat_train.json")
-        self.save_to_json(val_data, "chat_validation.json")
-        self.save_to_json(test_data, "chat_test.json")
+        self.save_to_json(train_data, "mcqa_train.json")
+        self.save_to_json(val_data, "mcqa_validation.json")
+        self.save_to_json(test_data, "mcqa_test.json")
         
         logger.info(f"✅ Successfully processed and saved dataset")
         logger.info(f"✅ Training examples: {len(train_data)}")

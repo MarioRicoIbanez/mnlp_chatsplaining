@@ -61,68 +61,55 @@ def parse_args():
     return parser.parse_args()
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Fine-tune Qwen model")
+    parser.add_argument("--reasoning_dataset", type=str, required=True,
+                       help="Name of the reasoning dataset to use")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B",
+                       help="Model name to use")
+    parser.add_argument("--max_samples", type=int, default=100,
+                       help="Maximum number of samples to use")
+    parser.add_argument("--output_dir", type=str, default="./output",
+                       help="Output directory for the model")
     
-    logger.info("🚀 Starting training with simplified approach:")
-    logger.info(f"   Model: {args.model_name}")
-    logger.info(f"   Dataset: {args.reasoning_dataset}")
-    logger.info(f"   Max samples: {args.max_samples}")
-    logger.info(f"   MCQA format: {args.is_mcqa}")
+    args = parser.parse_args()
     
-    # Initialize the trainer
+    print(f"🚀 Starting training with:")
+    print(f"   Model: {args.model_name}")
+    print(f"   Dataset: {args.reasoning_dataset}")
+    print(f"   Max samples: {args.max_samples}")
+    
+    # Initialize trainer
     trainer = ModelTrainer(
         model_name=args.model_name,
-        max_seq_length=args.max_seq_length,
-        load_in_4bit=args.load_in_4bit,
-        hf_token=args.hf_token,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
     )
     
-    # Prepare datasets
+    # Prepare dataset (assuming MCQA format for the provided dataset)
     trainer.prepare_datasets(
         reasoning_dataset_name=args.reasoning_dataset,
         max_samples=args.max_samples,
-        is_mcqa=args.is_mcqa
+        is_mcqa=True,  # Set to True for MCQA datasets like sciq_treated_epfl_mcqa
     )
     
     # Setup LoRA
-    trainer.setup_lora(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout
-    )
+    trainer.setup_lora()
     
     # Train the model
-    logger.info("🔥 Starting training...")
+    print("🔥 Starting training...")
     trainer_stats = trainer.train(
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        warmup_steps=args.warmup_steps,
-        num_train_epochs=args.num_train_epochs,
-        learning_rate=args.learning_rate,
-        logging_steps=args.logging_steps
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=2,
+        warmup_steps=5,
+        num_train_epochs=1,
+        learning_rate=2e-4,
+        logging_steps=0.1,  # Log more frequently for small datasets
     )
     
     # Save the model
-    trainer.save_model(
-        model_name=args.model_save_name,
-        push_to_hub=args.push_to_hub
-    )
+    trainer.save_model("qwen3-finetuned")
     
-    # Test generation (optional)
-    if hasattr(trainer.train_dataset, '__getitem__') and len(trainer.train_dataset) > 0:
-        sample = trainer.train_dataset[0]
-        if 'text' in sample:
-            # Extract question part for testing
-            sample_text = sample['text']
-            if "Answer:" in sample_text:
-                question_part = sample_text.split("Answer:")[0].strip()
-                logger.info("🧪 Testing generation...")
-                response = trainer.generate(question_part, max_new_tokens=200)
-                logger.info(f"Generated response: {response[:200]}...")
-    
-    logger.info("✅ Training completed successfully!")
-    logger.info(f"📊 Training stats: {trainer_stats}")
+    print("✅ Training completed successfully!")
+    print(f"📊 Training stats: {trainer_stats}")
 
 if __name__ == "__main__":
     main() 

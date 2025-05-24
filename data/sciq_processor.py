@@ -1,8 +1,19 @@
 from datasets import load_dataset, Dataset, DatasetDict
 from typing import List, Dict, Tuple
-from .base_processor import BaseDatasetProcessor
+import os
+import sys
+from pathlib import Path
+
+# Add parent directory to path when running as script
+if __name__ == "__main__":
+    sys.path.append(str(Path(__file__).parent.parent))
+    from data.base_processor import BaseDatasetProcessor
+else:
+    from .base_processor import BaseDatasetProcessor
+
 import logging
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class SciQProcessor(BaseDatasetProcessor):
@@ -15,31 +26,47 @@ class SciQProcessor(BaseDatasetProcessor):
         Returns:
             Tuple[List[Dict], List[Dict], List[Dict]]: Training, validation, and test data in MCQA format
         """
-        # Load the SciQ dataset
-        dataset = load_dataset("sciq")
+        logger.info("Loading SciQ dataset...")
+        try:
+            # Load the SciQ dataset with streaming to avoid memory issues
+            dataset = load_dataset("sciq", streaming=True)
+            logger.info("Dataset loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load dataset: {e}")
+            raise
         
         train_format = []
         val_format = []
         test_format = []
         
         # Process training data
-        for item in dataset["train"]:
+        logger.info("Processing training data...")
+        for i, item in enumerate(dataset["train"]):
+            if i % 100 == 0:
+                logger.info(f"Processed {i} training examples")
             processed_item = self._process_item(item)
             if processed_item:
                 train_format.append(processed_item)
         
         # Process validation data
-        for item in dataset["validation"]:
+        logger.info("Processing validation data...")
+        for i, item in enumerate(dataset["validation"]):
+            if i % 10 == 0:
+                logger.info(f"Processed {i} validation examples")
             processed_item = self._process_item(item)
             if processed_item:
                 val_format.append(processed_item)
         
         # Process test data
-        for item in dataset["test"]:
+        logger.info("Processing test data...")
+        for i, item in enumerate(dataset["test"]):
+            if i % 10 == 0:
+                logger.info(f"Processed {i} test examples")
             processed_item = self._process_item(item)
             if processed_item:
                 test_format.append(processed_item)
         
+        logger.info(f"Finished processing. Got {len(train_format)} training, {len(val_format)} validation, and {len(test_format)} test examples")
         return train_format, val_format, test_format
     
     def _process_item(self, item: Dict) -> Dict:
@@ -52,39 +79,43 @@ class SciQProcessor(BaseDatasetProcessor):
         Returns:
             Dict: Processed item in MCQA format or None if invalid
         """
-        question = item["question"]
-        correct = item["correct_answer"]
-        distractors = [item["distractor1"], item["distractor2"], item["distractor3"]]
-        
-        # Skip examples with fewer than 3 distractors
-        if len(distractors) != 3:
-            return None
-        
-        # Combine correct answer and distractors
-        choices = distractors + [correct]
-        choices = list(set(choices))  # deduplicate
-        
-        # Skip if we don't have exactly 4 unique choices
-        if len(choices) != 4:
-            return None
-        
-        # Sort choices for deterministic order
-        choices = sorted(choices)
-        
         try:
-            answer_index = choices.index(correct)
-        except ValueError:
-            return None  # correct answer not found
-        
-        # Create MCQA format example
-        return {
-            "question": question,
-            "choices": choices,
-            "answer_index": answer_index,
-            "answer_text": choices[answer_index],
-            "source": "sciq",
-            "explanation": item["support"]
-        }
+            question = item["question"]
+            correct = item["correct_answer"]
+            distractors = [item["distractor1"], item["distractor2"], item["distractor3"]]
+            
+            # Skip examples with fewer than 3 distractors
+            if len(distractors) != 3:
+                return None
+            
+            # Combine correct answer and distractors
+            choices = distractors + [correct]
+            choices = list(set(choices))  # deduplicate
+            
+            # Skip if we don't have exactly 4 unique choices
+            if len(choices) != 4:
+                return None
+            
+            # Sort choices for deterministic order
+            choices = sorted(choices)
+            
+            try:
+                answer_index = choices.index(correct)
+            except ValueError:
+                return None  # correct answer not found
+            
+            # Create MCQA format example
+            return {
+                "question": question,
+                "choices": choices,
+                "answer_index": answer_index,
+                "answer_text": choices[answer_index],
+                "source": "sciq",
+                "explanation": item["support"]
+            }
+        except Exception as e:
+            logger.warning(f"Error processing item: {e}")
+            return None
     
     def push_to_hub(self, repo_name: str = "RikoteMaster/sciq_treated_epfl_mcqa", token: str = None):
         """
@@ -104,6 +135,7 @@ class SciQProcessor(BaseDatasetProcessor):
         logger.info(f"Processed {len(test_data)} test examples")
         
         # Create datasets
+        logger.info("Creating Hugging Face datasets...")
         train_dataset = Dataset.from_list(train_data)
         val_dataset = Dataset.from_list(val_data)
         test_dataset = Dataset.from_list(test_data)
@@ -117,17 +149,20 @@ class SciQProcessor(BaseDatasetProcessor):
         
         # Push to hub
         logger.info(f"Pushing dataset to {repo_name}...")
-        dataset_dict.push_to_hub(
-            repo_name,
-            token=token,
-            commit_message="Add validation and test splits from allenai/sciq"
-        )
-        
-        logger.info("✅ Successfully pushed all splits to Hugging Face Hub!")
-        logger.info(f"✅ Repository: {repo_name}")
-        logger.info(f"✅ Train examples: {len(train_data)}")
-        logger.info(f"✅ Validation examples: {len(val_data)}")
-        logger.info(f"✅ Test examples: {len(test_data)}")
+        try:
+            dataset_dict.push_to_hub(
+                repo_name,
+                token=token,
+                commit_message="Add validation and test splits from allenai/sciq"
+            )
+            logger.info("✅ Successfully pushed all splits to Hugging Face Hub!")
+            logger.info(f"✅ Repository: {repo_name}")
+            logger.info(f"✅ Train examples: {len(train_data)}")
+            logger.info(f"✅ Validation examples: {len(val_data)}")
+            logger.info(f"✅ Test examples: {len(test_data)}")
+        except Exception as e:
+            logger.error(f"Failed to push to hub: {e}")
+            raise
 
 def main():
     processor = SciQProcessor()
