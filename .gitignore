@@ -8,3 +8,5 @@ figs/
 *.pywz
 *.pyzw
 *.pyzwz
+.env
+*.json
