@@ -18,13 +18,43 @@ https://huggingface.co/datasets/allenai/sciq
 
 https://drive.google.com/file/d/1wvqJfzLfLBUGTJiF_Wo9EvucE9D8HL8H/view?usp=sharing
 
-## ARC
 
-https://huggingface.co/datasets/allenai/ai2_arc
+## GENERAL KNOWLEDGE
 
-## Unified-all-mcqa
+https://huggingface.co/datasets/pszemraj/unified-mcqa-all
 
-https://huggingface.co/datasets/jonlecumberri/unified_mcqa_all
+600k
+
+## MEDREASON: Medicine and biology
+
+https://huggingface.co/datasets/UCSC-VLAA/MedReason
+
+32k
+
+## NVIDIA/OPENCODEREASON2: Coding
+
+https://huggingface.co/datasets/nvidia/OpenCodeReasoning-2
+
+1.42M
+
+## NVIDIA/OPENMATH: Mathematics
+
+https://huggingface.co/datasets/nvidia/OpenMathReasoning
+
+3.2M
+
+## CHEMISTRY: Chemistry
+
+https://huggingface.co/datasets/mlfoundations-dev/camel_chemistry_seed_science_20K
+
+20k
+
+## Engineering
+
+https://huggingface.co/datasets/mlfoundations-dev/stackexchange_engineering
+
+36k
+
 
 # STRUCTURE
 
