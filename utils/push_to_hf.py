@@ -67,19 +67,56 @@ class DatasetUploader:
                 return False
         
         return True
-    
-    def create_dataset(self, data: List[Dict]) -> Dataset:
+
+    def validate_openqa_format(self, data: List[Dict]) -> bool:
         """
-        Create a Hugging Face dataset from MCQA format data.
+        Validate that the data follows the OpenQA format.
+        
+        Required format for each item:
+        {
+            "question": str,
+            "answer": str,
+            "source": str,
+            "explanation": Optional[str]  # Explanation is optional but recommended
+        }
+        """
+        required_fields = {"question", "answer", "source"}
+        
+        for item in data:
+            if not all(field in item for field in required_fields):
+                logger.error(f"Missing required fields in item: {item}")
+                return False
+            if not isinstance(item["question"], str) or not item["question"].strip():
+                logger.error(f"Invalid question: {item['question']}")
+                return False
+            if not isinstance(item["answer"], str) or not item["answer"].strip():
+                logger.error(f"Invalid answer: {item['answer']}")
+                return False
+            if not isinstance(item["source"], str):
+                logger.error(f"Invalid source: {item['source']}")
+                return False
+        
+        return True
+    
+    def create_dataset(self, data: List[Dict], format_type: str = "mcqa") -> Dataset:
+        """
+        Create a Hugging Face dataset from data.
         
         Args:
-            data: List of dictionaries in MCQA format
+            data: List of dictionaries in MCQA or OpenQA format
+            format_type: Either "mcqa" or "openqa"
             
         Returns:
             Dataset: Hugging Face dataset object
         """
-        if not self.validate_mcqa_format(data):
-            raise ValueError("Data does not follow the required MCQA format")
+        if format_type == "mcqa":
+            if not self.validate_mcqa_format(data):
+                raise ValueError("Data does not follow the required MCQA format")
+        elif format_type == "openqa":
+            if not self.validate_openqa_format(data):
+                raise ValueError("Data does not follow the required OpenQA format")
+        else:
+            raise ValueError(f"Unknown format type: {format_type}")
             
         return Dataset.from_list(data)
     
@@ -119,41 +156,49 @@ class DatasetUploader:
             raise
 
 def main():
-    parser = argparse.ArgumentParser(description="Upload MCQA dataset to Hugging Face Hub.")
+    parser = argparse.ArgumentParser(description="Upload dataset to Hugging Face Hub.")
     parser.add_argument('--name', type=str, required=True, help='Hugging Face dataset repo name (e.g. username/dataset-name)')
     parser.add_argument('--output-dir', type=str, default="output", help='Directory containing the processed dataset files')
     parser.add_argument('--private', action='store_true', help='Make the dataset private')
+    parser.add_argument('--token', type=str, help='Hugging Face API token. If not provided, will look for HF_TOKEN environment variable')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     if not output_dir.exists():
         raise ValueError(f"Output directory {output_dir} does not exist")
 
-    files = [f for f in output_dir.glob("mcqa_*.json")]
-    if not files:
-        print("No mcqa_*.json files found in output directory.")
+    # Look for both MCQA and OpenQA files
+    mcqa_files = list(output_dir.glob("mcqa_*.json"))
+    openqa_files = list(output_dir.glob("openqa_*.json"))
+    
+    if not mcqa_files and not openqa_files:
+        print("No mcqa_*.json or openqa_*.json files found in output directory.")
         return
 
     print("Available dataset files in output directory:")
-    for idx, fname in enumerate(files):
+    all_files = mcqa_files + openqa_files
+    for idx, fname in enumerate(all_files):
         print(f"[{idx}] {fname.name}")
     
     selection = input("Enter the number(s) of the file(s) to upload (comma-separated, e.g. 0 or 0,1): ")
-    selected_indices = [int(i.strip()) for i in selection.split(",") if i.strip().isdigit() and int(i.strip()) < len(files)]
+    selected_indices = [int(i.strip()) for i in selection.split(",") if i.strip().isdigit() and int(i.strip()) < len(all_files)]
     if not selected_indices:
         print("No valid selection made. Exiting.")
         return
 
-    selected_files = [files[i] for i in selected_indices]
+    selected_files = [all_files[i] for i in selected_indices]
     datasets = {}
     
-    uploader = DatasetUploader(repo_id=args.name, output_dir=args.output_dir)
+    uploader = DatasetUploader(repo_id=args.name, token=args.token, output_dir=args.output_dir)
     
     for fname in selected_files:
-        split_name = fname.stem.replace("mcqa_", "")
+        # Determine format type from filename
+        format_type = "mcqa" if fname.name.startswith("mcqa_") else "openqa"
+        split_name = fname.stem.replace(f"{format_type}_", "")
+        
         with open(fname, "r", encoding="utf-8") as f:
             data = json.load(f)
-        ds = uploader.create_dataset(data)
+        ds = uploader.create_dataset(data, format_type=format_type)
         datasets[split_name] = ds
 
     dataset_dict = uploader.create_dataset_dict(datasets)
