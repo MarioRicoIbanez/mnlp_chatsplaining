@@ -40,6 +40,18 @@ Choices:
     lstrip_blocks=True,
 )
 
+_OPEN_ANSWER_TMPL = Template(
+    """<|im_start|>user
+The following is a question about knowledge and skills in advanced master‑level STEM courses.
+
+Question: {{ question }}
+
+<|im_end|>
+""",
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+
 _ASSISTANT_START = "<|im_start|>assistant\n"
 
 _ASSISTANT_BODY_TMPL = Template(
@@ -80,7 +92,7 @@ def process_mcq_dataset(
     Returns
     -------
     dict
-        ``{"prompt", "full_text", "prompt_len", "text"}``
+        ``{"prompt", "text", "prompt_len"``
     """
 
     # --- 1. Choices block ---------------------------------------------------
@@ -100,7 +112,7 @@ def process_mcq_dataset(
     )
 
     # --- 4. Full text -------------------------------------------------------
-    full_text = prompt + assistant_body + _ASSISTANT_END
+    text = prompt + assistant_body + _ASSISTANT_END
 
     # --- 5. Prompt length (optional) ---------------------------------------
     if tokenizer is not None:
@@ -110,13 +122,60 @@ def process_mcq_dataset(
 
     return {
         "prompt": prompt,
-        "full_text": full_text,
+        "text": text,
         "prompt_len": prompt_len,      # 
+    }
+
+def process_open_answer_dataset(
+    row: Dict[str, str],
+    *,
+    tokenizer=None,
+) -> Dict[str, str | int | None]:
+    """Convert one *row* into the structure required by the training pipeline for open answer questions.
+
+    Parameters
+    ----------
+    row : dict
+        Must contain ``question``, ``answer``, and optionally ``explanation``.
+    tokenizer : Pre-trained tokenizer (optional)
+        If supplied, we compute ``prompt_len`` (number of tokens in *prompt*)
+        so the collator can create an attention mask faster.
+
+    Returns
+    -------
+    dict
+        ``{"prompt", "text", "prompt_len"}``
+    """
+
+    # --- 1. Prompt (system+user+assistant header) ---------------------------
+    prompt = _SYSTEM_BLOCK + _OPEN_ANSWER_TMPL.render(question=row["question"]) + _ASSISTANT_START
+
+    # --- 2. Assistant body --------------------------------------------------
+    assistant_body = _ASSISTANT_BODY_TMPL.render(
+        explanation=row.get("explanation", ""),  # Optional explanation
+        answer_text=row["answer"],
+    )
+
+    # --- 3. Full text -------------------------------------------------------
+    text = prompt + assistant_body + _ASSISTANT_END
+
+    # --- 4. Prompt length (optional) ---------------------------------------
+    if tokenizer is not None:
+        prompt_len = len(tokenizer(prompt)["input_ids"])
+    else:
+        prompt_len = None
+
+    return {
+        "prompt": prompt,
+        "text": text,
+        "prompt_len": prompt_len,
     }
 
 
 def tokenize_func(ex, tokenizer):
-    tok = tokenizer(ex["full_text"], truncation=True)
+    # Tokenize with truncation - using 8192 tokens to accommodate long explanations
+    # Qwen models support up to 8192 tokens
+    tok = tokenizer(ex["text"], truncation=True, max_length=8_192)
     tok["prompt_len"] = ex["prompt_len"]          # keep for masking later
     return tok
 
@@ -127,15 +186,41 @@ class SFTDataCollator:
         self.tokenizer = tokenizer
 
     def __call__(self, batch):
-        # Convert list of tokenized samples to padded tensor batch
-        input_ids_list = [torch.tensor(b["input_ids"]) for b in batch]
-        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-        # Attention mask: 1 for real tokens, 0 for pad
-        attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
-        # Create labels (copy of input_ids)
-        labels = input_ids.clone()
-        # Mask out prompt part
-        for i, b in enumerate(batch):
-            prompt_len = b["prompt_len"]  # length of prompt in tokens
-            labels[i, :prompt_len] = -100  # ignore prompt tokens in loss
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels} 
+        try:
+            # Handle single sample case (batch_size=1)
+            if len(batch) == 1:
+                b = batch[0]
+                input_ids = torch.tensor(b["input_ids"], dtype=torch.long).unsqueeze(0)  # Add batch dimension
+                attention_mask = torch.ones_like(input_ids)
+                labels = input_ids.clone()
+                # Mask out prompt part if prompt_len exists
+                if "prompt_len" in b:
+                    labels[0, :b["prompt_len"]] = -100  # ignore prompt tokens in loss
+            else:
+                # Convert list of tokenized samples to padded tensor batch
+                input_ids_list = [torch.tensor(b["input_ids"], dtype=torch.long) for b in batch]
+                input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+                
+                # Attention mask: 1 for real tokens, 0 for pad
+                attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+                
+                # Create labels (copy of input_ids)
+                labels = input_ids.clone()
+                
+                # Mask out prompt part if prompt_len exists
+                for i, b in enumerate(batch):
+                    if "prompt_len" in b:
+                        prompt_len = b["prompt_len"]  # length of prompt in tokens
+                        labels[i, :prompt_len] = -100  # ignore prompt tokens in loss
+            
+            # Move tensors to CPU if they're not needed on GPU immediately
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels
+            }
+        except Exception as e:
+            # Log the error and batch information for debugging
+            print(f"Error in DataCollator: {str(e)}")
+            print(f"Batch keys: {[b.keys() for b in batch]}")
+            raise
