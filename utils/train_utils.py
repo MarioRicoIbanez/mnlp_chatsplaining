@@ -25,3 +25,21 @@ def plot_training_loss(trainer: Trainer, figs_dir: Path) -> None:
     figs_dir.mkdir(exist_ok=True)
     plt.savefig(figs_dir / "loss_curve.png")
     plt.show() 
+
+
+def train_open_answer(model, tokenizer, dataset): 
+
+    """This code is used to train qwen model with an open answer dataset, by this way, we can improve the model's reasoning ability
+    
+    Args:
+        model: The model to train
+        tokenizer: The tokenizer to use
+        dataset: The dataset to train on
+
+    Returns:
+        The trained model
+    """
+    
+
+
+

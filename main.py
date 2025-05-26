@@ -43,6 +43,8 @@ def main():
         # train_dataset = train_dataset.select(range(100))
         train_dataset = train_dataset.map(process_mcq_dataset, fn_kwargs={"tokenizer": tokenizer})
 
+    
+
     tokenized_dataset = train_dataset.map(
         tokenize_func, 
         fn_kwargs={"tokenizer": tokenizer}, 

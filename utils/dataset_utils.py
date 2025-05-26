@@ -40,6 +40,18 @@ Choices:
     lstrip_blocks=True,
 )
 
+_OPEN_ANSWER_TMPL = Template(
+    """<|im_start|>user
+The following is a question about knowledge and skills in advanced master‑level STEM courses.
+
+Question: {{ question }}
+
+<|im_end|>
+""",
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+
 _ASSISTANT_START = "<|im_start|>assistant\n"
 
 _ASSISTANT_BODY_TMPL = Template(
@@ -112,6 +124,51 @@ def process_mcq_dataset(
         "prompt": prompt,
         "full_text": full_text,
         "prompt_len": prompt_len,      # 
+    }
+
+def process_open_answer_dataset(
+    row: Dict[str, str],
+    *,
+    tokenizer=None,
+) -> Dict[str, str | int | None]:
+    """Convert one *row* into the structure required by the training pipeline for open answer questions.
+
+    Parameters
+    ----------
+    row : dict
+        Must contain ``question``, ``answer``, and optionally ``explanation``.
+    tokenizer : Pre‑trained tokenizer (optional)
+        If supplied, we compute ``prompt_len`` (number of tokens in *prompt*)
+        so the collator can create an attention mask faster.
+
+    Returns
+    -------
+    dict
+        ``{"prompt", "full_text", "prompt_len"}``
+    """
+
+    # --- 1. Prompt (system+user+assistant header) ---------------------------
+    prompt = _SYSTEM_BLOCK + _OPEN_ANSWER_TMPL.render(question=row["question"]) + _ASSISTANT_START
+
+    # --- 2. Assistant body --------------------------------------------------
+    assistant_body = _ASSISTANT_BODY_TMPL.render(
+        explanation=row.get("explanation", ""),  # Optional explanation
+        answer_text=row["answer"],
+    )
+
+    # --- 3. Full text -------------------------------------------------------
+    full_text = prompt + assistant_body + _ASSISTANT_END
+
+    # --- 4. Prompt length (optional) ---------------------------------------
+    if tokenizer is not None:
+        prompt_len = len(tokenizer(prompt)["input_ids"])
+    else:
+        prompt_len = None
+
+    return {
+        "prompt": prompt,
+        "full_text": full_text,
+        "prompt_len": prompt_len,
     }
 
 
