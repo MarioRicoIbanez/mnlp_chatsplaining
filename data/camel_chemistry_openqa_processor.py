@@ -1,50 +1,60 @@
-import json
 import os
 import random
 import logging
-from pathlib import Path
 from typing import List, Dict, Tuple
 
-from datasets import Dataset, DatasetDict
+from datasets import load_dataset, Dataset, DatasetDict
+from dotenv import load_dotenv
 
 # Handle relative import when running directly vs as module
 if __name__ == "__main__":
     import sys
+    from pathlib import Path
     sys.path.append(str(Path(__file__).parent.parent))
     from data.base_openans_processor import BaseOpenQAProcessor
 else:
     from .base_openans_processor import BaseOpenQAProcessor
 
-from dotenv import load_dotenv
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class OpenAnswerProcessor(BaseOpenQAProcessor):
-    """Processor for the m1_preference_data.json open-answer dataset."""
 
-    def __init__(self, json_path: str, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.json_path = json_path
+class OpenAnswerProcessor(BaseOpenQAProcessor):
+    """Processor for the CAMEL Chemistry dataset in open-answer format."""
 
     def process_dataset(self) -> Tuple[List[Dict], List[Dict], List[Dict]]:
-        logger.info("Loading JSON file...")
-        with open(self.json_path, "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
+        logger.info("Loading CAMEL Chemistry dataset...")
+        try:
+            dataset = load_dataset("mlfoundations-dev/camel_chemistry_seed_science_20K")
+            logger.info("Dataset loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load dataset: {e}")
+            raise
 
-        logger.info("Filtering open_answer questions...")
-        data = [
-            {
-                "question": item["question_body"].strip(),
-                "answer": item["question_answer"].strip(),
-                "source": "m1_preference_data",
-                "explanation": ""
-            }
-            for item in raw_data
-            if item.get("question_type") == "open_answer"
-        ]
+        raw_data = dataset["train"]
+        logger.info(f"Processing {len(raw_data)} examples...")
 
-        logger.info(f"Found {len(data)} open-answer examples")
+        data = []
+        for item in raw_data:
+            question = item.get("problem", "")
+            solution = item.get("deepseek_solution", "")
+            explanation = item.get("reasoning", "")
+
+            # if not question or not isinstance(solutions, list) or not solutions:
+            #     continue
+
+            # answer = solutions[0].strip()
+            # if not answer:
+            #     continue
+
+            data.append({
+                "question": question,
+                "answer": solution,
+                "explanation": explanation,
+                "source": "camel_chemistry_seed_science_20K"
+            })
+
+        logger.info(f"Collected {len(data)} open-answer examples")
         random.shuffle(data)
 
         n = len(data)
@@ -80,14 +90,14 @@ class OpenAnswerProcessor(BaseOpenQAProcessor):
         dataset_dict.push_to_hub(
             repo_name,
             token=token,
-            commit_message="Upload open-answer STEM dataset from m1_preference_data"
+            commit_message="Upload CAMEL Chemistry dataset in OpenQA format"
         )
-        logger.info("✅ Successfully pushed to Hugging Face Hub")
+        logger.info("✅ Successfully pushed to Hugging Face Hub!")
 
 
 def main():
-    processor = OpenAnswerProcessor(json_path="data/m1_preference_data.json")
-    processor.push_to_hub(repo_name="jonlecumberri/stem-open-answer-preferences")
+    processor = OpenAnswerProcessor()
+    processor.push_to_hub(repo_name="jonlecumberri/camel_chemistry_openqa")
 
 
 if __name__ == "__main__":

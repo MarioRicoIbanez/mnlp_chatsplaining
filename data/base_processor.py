@@ -55,8 +55,8 @@ class BaseDatasetProcessor(ABC):
         Required format for each item:
         {
             "question": str,
-            "choices": List[str],  # Must be exactly 4 choices
-            "answer_index": int,   # Index of correct answer (0-3)
+            "choices": List[str],  # Must be between 2 and 5 choices
+            "answer_index": int,   # Index of correct answer
             "answer_text": str,    # Text of correct answer
             "source": str,         # Source of the question
             "explanation": str     # Explanation for the answer
@@ -70,14 +70,14 @@ class BaseDatasetProcessor(ABC):
                 logger.error(f"Missing required fields in item: {item}")
                 return False
             
-            # Check choices is a list of exactly 4 items
-            if not isinstance(item["choices"], list) or len(item["choices"]) != 4:
-                logger.error(f"Choices must be a list of exactly 4 items: {item['choices']}")
+            # Check choices is a list of 2–5 items
+            if not isinstance(item["choices"], list) or not (2 <= len(item["choices"]) <= 7):
+                logger.error(f"Choices must be a list of 2 to 5 items: {item['choices']}")
                 return False
             
-            # Check answer_index is valid
-            if not isinstance(item["answer_index"], int) or item["answer_index"] not in range(4):
-                logger.error(f"answer_index must be an integer between 0 and 3: {item['answer_index']}")
+            # Check answer_index is within range
+            if not isinstance(item["answer_index"], int) or not (0 <= item["answer_index"] < len(item["choices"])):
+                logger.error(f"answer_index must be an integer within the choices range: {item['answer_index']}")
                 return False
             
             # Check answer_text matches the choice at answer_index
@@ -125,4 +125,4 @@ class BaseDatasetProcessor(ABC):
         logger.info(f"✅ Successfully processed and saved dataset")
         logger.info(f"✅ Training examples: {len(train_data)}")
         logger.info(f"✅ Validation examples: {len(val_data)}")
-        logger.info(f"✅ Test examples: {len(test_data)}") 
+        logger.info(f"✅ Test examples: {len(test_data)}")
