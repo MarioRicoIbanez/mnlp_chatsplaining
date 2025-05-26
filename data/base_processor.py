@@ -71,7 +71,7 @@ class BaseDatasetProcessor(ABC):
                 return False
             
             # Check choices is a list of 2–5 items
-            if not isinstance(item["choices"], list) or not (2 <= len(item["choices"]) <= 5):
+            if not isinstance(item["choices"], list) or not (2 <= len(item["choices"]) <= 7):
                 logger.error(f"Choices must be a list of 2 to 5 items: {item['choices']}")
                 return False
             
