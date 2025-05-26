@@ -30,6 +30,12 @@ class OpenMathProcessor(BaseOpenQAProcessor):
             max_examples (int, optional): Maximum number of examples to process. If None, process all examples.
             *args, **kwargs: Additional arguments passed to BaseOpenQAProcessor
         """
+        # Set the output directory to be inside the data folder
+        if 'output_dir' not in kwargs:
+            # Get the directory where this script is located (data folder)
+            data_dir = Path(__file__).parent
+            kwargs['output_dir'] = str(data_dir / "output")
+        
         super().__init__(*args, **kwargs)
         self.max_examples = max_examples
 
