@@ -10,8 +10,5 @@ figs/
 *.pyzwz
 .env
 *.json
-
-wandb/
-
 **Qwen**
 **results_model**
