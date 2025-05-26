@@ -3,12 +3,68 @@
 import logging
 import torch
 from typing import Dict, List, Optional
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
-from utils.dataset_utils import _SYSTEM_BLOCK, _OPEN_ANSWER_TMPL, _ASSISTANT_START
+from utils.dataset_utils import _SYSTEM_BLOCK, _OPEN_ANSWER_TMPL, _ASSISTANT_START, process_mcq_dataset
 
 logger = logging.getLogger(__name__)
+
+def load_mcqa_test_data(tokenizer: PreTrainedTokenizer, num_samples: int = 6) -> Dataset:
+    """
+    Load test samples from the MCQA dataset.
+    
+    Args:
+        tokenizer: The tokenizer to use for processing
+        num_samples: Number of test samples to load
+        
+    Returns:
+        Dataset containing processed test samples
+    """
+    # Load test split from MCQA dataset
+    test_dataset = load_dataset("jonlecumberri/mcqa_merged", split="test")
+    
+    # Take specified number of samples
+    test_samples = test_dataset.select(range(min(num_samples, len(test_dataset))))
+    
+    # Process samples using the same function as training data
+    processed_samples = test_samples.map(
+        process_mcq_dataset,
+        fn_kwargs={"tokenizer": tokenizer},
+        remove_columns=test_samples.column_names
+    )
+    
+    return processed_samples
+
+def load_openqa_test_data(num_samples_per_dataset: int = 3) -> Dataset:
+    """
+    Load test samples from OpenCode and OpenMath datasets.
+    
+    Args:
+        num_samples_per_dataset: Number of samples to load from each dataset
+        
+    Returns:
+        Dataset containing test samples from both datasets
+    """
+    # Load test splits from both datasets
+    opencode_test = load_dataset("RikoteMaster/OpenCodeTreated", split="train")
+    openmath_test = load_dataset("RikoteMaster/OpenMathTreated", split="train")
+    
+    # Take specified number of samples from each
+    opencode_samples = opencode_test.select(range(min(num_samples_per_dataset, len(opencode_test))))
+    openmath_samples = openmath_test.select(range(min(num_samples_per_dataset, len(openmath_test))))
+    
+    # Add source information
+    opencode_samples = opencode_samples.map(lambda x: {"source": "OpenCode", **x})
+    openmath_samples = openmath_samples.map(lambda x: {"source": "OpenMath", **x})
+    
+    # Combine samples
+    combined_samples = Dataset.from_dict({
+        "question": opencode_samples["question"] + openmath_samples["question"],
+        "source": opencode_samples["source"] + openmath_samples["source"]
+    })
+    
+    return combined_samples
 
 def evaluate_model_on_samples(
     model: PreTrainedModel,
