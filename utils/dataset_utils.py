@@ -137,7 +137,7 @@ def process_open_answer_dataset(
     ----------
     row : dict
         Must contain ``question``, ``answer``, and optionally ``explanation``.
-    tokenizer : Pre‑trained tokenizer (optional)
+    tokenizer : Pre-trained tokenizer (optional)
         If supplied, we compute ``prompt_len`` (number of tokens in *prompt*)
         so the collator can create an attention mask faster.
 
@@ -173,7 +173,9 @@ def process_open_answer_dataset(
 
 
 def tokenize_func(ex, tokenizer):
-    tok = tokenizer(ex["full_text"], truncation=True)
+    # Tokenize with truncation - using 8192 tokens to accommodate long explanations
+    # Qwen models support up to 8192 tokens
+    tok = tokenizer(ex["full_text"], truncation=True, max_length=8192)
     tok["prompt_len"] = ex["prompt_len"]          # keep for masking later
     return tok
 
