@@ -16,13 +16,13 @@ from utils.dataset_utils import tokenize_func, SFTDataCollator, process_open_ans
 from utils.model_utils import load_model
 from utils.train_utils import plot_training_loss
 from utils.eval_utils import evaluate_openqa, evaluate_model_on_samples, load_mcqa_test_data, load_openqa_test_data
-from utils.batching import TokenBatchSampler
+from utils.batching import SmartPaddingTokenBatchSampler
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train and evaluate a language model')
-    parser.add_argument('--dataset', type=str, default="jonlecumberri/mcqa_merged",
-                      help='Dataset to use for training (default: jonlecumberri/mcqa_merged)')
-    parser.add_argument('--output_name', type=str, default="Qwen3-0.6B-SFT-MCQA",
+    parser.add_argument('--dataset', type=str, default="RikoteMaster/OpenQA_merged",
+                      help='Dataset to use for training (default: RikoteMaster/OpenQA_merged)')
+    parser.add_argument('--output_name', type=str, default="Qwen3-0.6B-SFT-aux",
                       help='Name for output directory and HuggingFace push (default: Qwen3-0.6B-SFT-MCQA)')
     parser.add_argument('--num_train_samples', type=int, default=None,
                       help='Number of training samples to use (default: use full dataset)')
@@ -129,12 +129,16 @@ def main():
         num_proc=4,  # speeds it up
     )
 
+    # Sort dataset by length
+    logger.info("Sorting dataset by sequence length...")
+    tokenized_dataset = tokenized_dataset.sort("length", reverse=True)
+
     # 3. Training Setup
     data_collator = SFTDataCollator(tokenizer=tokenizer)
 
     # Set up token-budget batching
     max_tok_per_gpu = 8_000  # fits comfortably in 24 GB with bf16
-    sampler = TokenBatchSampler(tokenized_dataset["length"], max_tok_per_gpu)
+    sampler = SmartPaddingTokenBatchSampler(tokenized_dataset["length"], max_tok_per_gpu)
 
     # Create custom dataloader
     dl = DataLoader(
@@ -170,8 +174,7 @@ def main():
     )
 
     trainer.train_dataset = tokenized_dataset   #  so metrics still work
-    trainer._train_dataloader = lambda: dl  #  monkey-patch the custom loader
-
+    trainer.get_train_dataloader = lambda: dl
     # 4. Training
     trainer.train()
 
@@ -184,13 +187,19 @@ def main():
     # Clear GPU cache after training
     torch.cuda.empty_cache()
 
-    # 5. Save model
-    logger.info("Saving model...")
+    # 5. Save model in results_model directory
+    results_model_dir = SCRIPT_DIR / "results_model" / args.output_name
+    results_model_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Saving model to results directory: {results_model_dir}")
+    model.save_pretrained(results_model_dir)
+    tokenizer.save_pretrained(results_model_dir)
+    logger.info("Model saved to results directory successfully")
+
+    # Save model in original output directory
+    logger.info("Saving model to output directory...")
     model.save_pretrained(SCRIPT_DIR / output_dir)
     tokenizer.save_pretrained(SCRIPT_DIR / output_dir)
     logger.info("Model saved successfully")
-
-    # Push to HuggingFace
 
     # 6. Plotting and Saving Results
     logger.info("Generating and saving training loss plot...")
