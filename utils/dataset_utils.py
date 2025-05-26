@@ -186,15 +186,41 @@ class SFTDataCollator:
         self.tokenizer = tokenizer
 
     def __call__(self, batch):
-        # Convert list of tokenized samples to padded tensor batch
-        input_ids_list = [torch.tensor(b["input_ids"]) for b in batch]
-        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-        # Attention mask: 1 for real tokens, 0 for pad
-        attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
-        # Create labels (copy of input_ids)
-        labels = input_ids.clone()
-        # Mask out prompt part
-        for i, b in enumerate(batch):
-            prompt_len = b["prompt_len"]  # length of prompt in tokens
-            labels[i, :prompt_len] = -100  # ignore prompt tokens in loss
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels} 
+        try:
+            # Handle single sample case (batch_size=1)
+            if len(batch) == 1:
+                b = batch[0]
+                input_ids = torch.tensor(b["input_ids"], dtype=torch.long).unsqueeze(0)  # Add batch dimension
+                attention_mask = torch.ones_like(input_ids)
+                labels = input_ids.clone()
+                # Mask out prompt part if prompt_len exists
+                if "prompt_len" in b:
+                    labels[0, :b["prompt_len"]] = -100  # ignore prompt tokens in loss
+            else:
+                # Convert list of tokenized samples to padded tensor batch
+                input_ids_list = [torch.tensor(b["input_ids"], dtype=torch.long) for b in batch]
+                input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+                
+                # Attention mask: 1 for real tokens, 0 for pad
+                attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+                
+                # Create labels (copy of input_ids)
+                labels = input_ids.clone()
+                
+                # Mask out prompt part if prompt_len exists
+                for i, b in enumerate(batch):
+                    if "prompt_len" in b:
+                        prompt_len = b["prompt_len"]  # length of prompt in tokens
+                        labels[i, :prompt_len] = -100  # ignore prompt tokens in loss
+            
+            # Move tensors to CPU if they're not needed on GPU immediately
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels
+            }
+        except Exception as e:
+            # Log the error and batch information for debugging
+            print(f"Error in DataCollator: {str(e)}")
+            print(f"Batch keys: {[b.keys() for b in batch]}")
+            raise

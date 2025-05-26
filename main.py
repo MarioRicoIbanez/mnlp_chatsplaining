@@ -9,12 +9,14 @@ import argparse
 from datasets import load_dataset, Dataset
 from transformers import TrainingArguments, Trainer
 from dotenv import load_dotenv
+from torch.utils.data import DataLoader
 
 # Local imports
 from utils.dataset_utils import tokenize_func, SFTDataCollator, process_open_answer_dataset, process_mcq_dataset
 from utils.model_utils import load_model
 from utils.train_utils import plot_training_loss
 from utils.eval_utils import evaluate_openqa, evaluate_model_on_samples, load_mcqa_test_data, load_openqa_test_data
+from utils.batching import TokenBatchSampler
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train and evaluate a language model')
@@ -101,6 +103,16 @@ def main():
             batch_size=1,  # Process one at a time  
             remove_columns=train_dataset.column_names
         )
+    # Print first 5 samples showing just the text field
+    logger.info("\nFirst 5 text samples:")
+    for i in range(5):
+        logger.info(f"\n{'='*80}")
+        logger.info(f"SAMPLE {i+1}")
+        logger.info(f"{'='*80}")
+        # Access text directly from the dataset's text column
+        text = train_dataset['text'][i]
+        logger.info(text)
+        logger.info(f"{'-'*80}")
 
     logger.info("Tokenizing dataset...")
     tokenized_dataset = train_dataset.map(
@@ -110,35 +122,55 @@ def main():
         remove_columns=train_dataset.column_names
     )
 
+    # Add sequence lengths to dataset
+    logger.info("Computing sequence lengths...")
+    tokenized_dataset = tokenized_dataset.map(
+        lambda ex: {"length": len(ex["input_ids"])},
+        num_proc=4,  # speeds it up
+    )
+
     # 3. Training Setup
     data_collator = SFTDataCollator(tokenizer=tokenizer)
+
+    # Set up token-budget batching
+    max_tok_per_gpu = 8_000  # fits comfortably in 24 GB with bf16
+    sampler = TokenBatchSampler(tokenized_dataset["length"], max_tok_per_gpu)
+
+    # Create custom dataloader
+    dl = DataLoader(
+        tokenized_dataset,
+        batch_sampler=sampler,
+        collate_fn=data_collator,
+        num_workers=0,  # or >0 if RAM allows
+        pin_memory=False,
+    )
 
     training_args = TrainingArguments(
         output_dir=str(SCRIPT_DIR / output_dir),
         overwrite_output_dir=True,
         num_train_epochs=1,
-        per_device_train_batch_size=2,
         gradient_accumulation_steps=4,  # Increased for stability
-        logging_steps=5,  # More frequent logging for small dataset
+        logging_steps=20,  # More frequent logging for small dataset
         save_steps=1000,
         report_to="wandb",
         bf16=True,
         disable_tqdm=False,
-        remove_unused_columns=False,
+        remove_unused_columns=True,
         gradient_checkpointing=True,  # Enable gradient checkpointing
-        dataloader_num_workers=0,     # Reduce memory usage
-        dataloader_pin_memory=False,  # Disable pin memory
         max_grad_norm=1.0,           # Gradient clipping for stability
         warmup_steps=1,              # Minimal warmup for small dataset
     )
 
     trainer = Trainer(
         model=model,
-        train_dataset=tokenized_dataset,
-        data_collator=data_collator,
         args=training_args,
+        train_dataset=None,   # <- give None here…
+        data_collator=data_collator,
+        tokenizer=tokenizer,
     )
-    logger.info("Trainer initialized successfully")
+
+    trainer.train_dataset = tokenized_dataset   #  so metrics still work
+    trainer._train_dataloader = lambda: dl  #  monkey-patch the custom loader
 
     # 4. Training
     trainer.train()
