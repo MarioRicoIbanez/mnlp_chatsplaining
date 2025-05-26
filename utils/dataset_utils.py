@@ -175,7 +175,7 @@ def process_open_answer_dataset(
 def tokenize_func(ex, tokenizer):
     # Tokenize with truncation - using 8192 tokens to accommodate long explanations
     # Qwen models support up to 8192 tokens
-    tok = tokenizer(ex["text"], truncation=True, max_length=6_000)
+    tok = tokenizer(ex["text"], truncation=True, max_length=8_192)
     tok["prompt_len"] = ex["prompt_len"]          # keep for masking later
     return tok
 

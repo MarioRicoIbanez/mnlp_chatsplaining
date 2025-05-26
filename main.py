@@ -12,6 +12,7 @@ from transformers import TrainingArguments, Trainer
 from utils.dataset_utils import process_mcq_dataset, tokenize_func, SFTDataCollator, process_open_answer_dataset
 from utils.model_utils import load_model
 from utils.train_utils import plot_training_loss
+from utils.eval_utils import evaluate_openqa
 
 # Get the directory where this script is located
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -45,8 +46,6 @@ def main():
     logger.info("Converting first 10 examples to regular dataset...")
     train_dataset = []
     for i, example in enumerate(streaming_dataset):
-        if i >= 1_000:
-            break
         train_dataset.append(example)
     train_dataset = Dataset.from_list(train_dataset)
     logger.info(f"Processing {len(train_dataset)} examples")
@@ -112,95 +111,70 @@ def main():
     # Clear GPU cache after training
     torch.cuda.empty_cache()
 
-    # 5. Plotting and Saving Results
+    # 5. Save model
+    logger.info("Saving model...")
+    model.save_pretrained(SCRIPT_DIR / "qwen_sft_demo")
+    tokenizer.save_pretrained(SCRIPT_DIR / "qwen_sft_demo")
+    logger.info("Model saved successfully")
+
+    # Push to HuggingFace
+    logger.info("Pushing model to HuggingFace...")
+    model.push_to_hub("RikoteMaster/Qwen3-0.6B-SFT-OpenQA", private=True, token="")
+    logger.info("Model pushed to HuggingFace successfully")
+    
+
+    # 6. Plotting and Saving Results
     logger.info("Generating and saving training loss plot...")
     plot_training_loss(trainer, FIGS_DIR)
     logger.info("Training loss plot saved successfully")
 
-    # 6. Evaluation on test dataset (simplified and memory-efficient)
-    logger.info("Loading test dataset for evaluation...")
-    test_dataset = load_dataset("RikoteMaster/sciq_treated_epfl_mcqa", split="test", streaming=True)
-    logger.info("Test dataset loaded in streaming mode")
+    # 7. Evaluation on OpenCode and OpenMath samples
+    logger.info("Loading test samples for evaluation...")
     
-    # Process first 3 test samples for evaluation (reduced for memory)
-    logger.info("Evaluating model on first 3 test samples...")
-    test_samples = []
-    for i, example in enumerate(test_dataset):
-        if i >= 3:
+    # Load OpenCode samples
+    opencode_dataset = load_dataset("RikoteMaster/OpenCodeTreated", split="train", streaming=True)
+    logger.info("Loading OpenMath samples...")
+    openmath_dataset = load_dataset("RikoteMaster/OpenMathTreated", split="train", streaming=True)
+    
+    # Get 3 samples from each dataset
+    logger.info("Selecting samples for evaluation...")
+    opencode_samples = []
+    openmath_samples = []
+    
+    for i, example in enumerate(opencode_dataset):
+        if i >= 3:  # Get 3 samples from OpenCode
             break
-        test_samples.append(example)
+        opencode_samples.append(example)
+    
+    for i, example in enumerate(openmath_dataset):
+        if i >= 3:  # Get 3 samples from OpenMath
+            break
+        openmath_samples.append(example)
+    
+    # Combine samples and add source information
+    test_samples = []
+    for sample in opencode_samples:
+        sample['source'] = 'OpenCode'
+        test_samples.append(sample)
+    for sample in openmath_samples:
+        sample['source'] = 'OpenMath'
+        test_samples.append(sample)
+
+
     
     test_samples = Dataset.from_list(test_samples)
-    processed_test_samples = test_samples.map(
-        process_mcq_dataset, 
-        fn_kwargs={"tokenizer": tokenizer},
-        batch_size=1
+    
+    # Evaluate model using the OpenQA evaluation function
+    evaluate_openqa(
+        model=model,
+        tokenizer=tokenizer,
+        test_samples=test_samples,
+        max_new_tokens=2000,
+        temperature=0.7
     )
     
-    print("\n" + "="*80)
-    print("EVALUATION: Model predictions vs Ground Truth")
-    print("="*80)
-    
-    correct_predictions = 0
-    total_predictions = 0
-    
-    for i, sample in enumerate(processed_test_samples):
-        print(f"\n--- SAMPLE {i+1} ---")
-        print(f"Question: {sample.get('question', 'N/A')}")
-        print(f"Choices: {sample.get('choices', 'N/A')}")
-        print(f"Ground Truth Answer: {sample.get('answer_text', 'N/A')}")
-        
-        # Use only the prompt (without the answer) for generation
-        prompt_only = sample['prompt']
-        
-        # Tokenize and generate
-        inputs = tokenizer(prompt_only, return_tensors="pt").to(model.device)
-        
-        # Generate response
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs, 
-                max_new_tokens=2000,
-                do_sample=True,
-                temperature=0.7,
-                pad_token_id=tokenizer.eos_token_id
-            )
-        
-        # Decode only the generated part (excluding the input prompt)
-        generated_text = tokenizer.decode(
-            output_ids[0][inputs['input_ids'].shape[1]:], 
-            skip_special_tokens=True
-        ).strip()
-        
-        print(f"\nModel Generated:")
-        print(f"'{generated_text}'")
-        
-        # Simple evaluation: check if the correct answer letter appears in generated text
-        ground_truth = sample.get('answer_text', '')
-        choices = sample.get('choices', [])
-        
-        if isinstance(choices, list) and ground_truth in choices:
-            correct_answer_index = choices.index(ground_truth)
-            correct_letter = chr(65 + correct_answer_index)  # A, B, C, D
-            
-            # Check if the correct letter appears in the generated response
-            is_correct = correct_letter in generated_text.upper()
-            correct_predictions += int(is_correct)
-            total_predictions += 1
-            
-            print(f"Expected Answer: {correct_letter}. {ground_truth}")
-            print(f"Prediction: {'✓ CORRECT' if is_correct else '✗ INCORRECT'}")
-        else:
-            print(f"Could not evaluate this sample")
-        
-        print("-" * 60)
-    
-    # Print overall accuracy
-    if total_predictions > 0:
-        accuracy = correct_predictions / total_predictions * 100
-        print(f"\nOVERALL ACCURACY: {correct_predictions}/{total_predictions} = {accuracy:.1f}%")
-    else:
-        print(f"\nCould not compute accuracy")
+    logger.info("Evaluation complete")
+
 
 if __name__ == "__main__":
     main()
