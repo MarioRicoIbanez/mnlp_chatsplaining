@@ -1,6 +1,13 @@
-# Model loading utils 
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, DataCollatorForLanguageModeling, TrainingArguments
-import torch 
+# Model loading utils
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    DataCollatorForLanguageModeling,
+    TrainingArguments,
+)
+import torch
+
 
 def load_model(
     model_name: str,
@@ -15,7 +22,7 @@ def load_model(
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
     """
     Load a model and tokenizer in 4-bit precision.
-    
+
     Args:
         model_name (str): Name or path of the model to load
         hf_token (str, optional): HuggingFace token for private models. Defaults to None.
@@ -60,13 +67,10 @@ def load_model(
         model_kwargs["quantization_config"] = bnb_config
 
     # Load model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        **model_kwargs
-    )
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
 
     # Configure model for training
     model.config.use_cache = use_cache
     model.config.pretraining_tp = pretraining_tp
 
-    return model, tokenizer 
+    return model, tokenizer

@@ -22,10 +22,16 @@ def merge_datasets(dataset_paths: List[str]) -> DatasetDict:
             logger.error(f"Failed to load dataset {path}: {e}")
             continue
 
-        for split in tqdm(merged_splits, desc=f"→ Processing splits for {path}", leave=False):
+        for split in tqdm(
+            merged_splits, desc=f"→ Processing splits for {path}", leave=False
+        ):
             if split in ds:
                 dataset_split = ds[split].remove_columns(
-                    [col for col in ds[split].column_names if col not in required_columns]
+                    [
+                        col
+                        for col in ds[split].column_names
+                        if col not in required_columns
+                    ]
                 )
                 dataset_split = dataset_split.select_columns(required_columns)
 
@@ -44,17 +50,19 @@ def merge_datasets(dataset_paths: List[str]) -> DatasetDict:
     return merged_dataset
 
 
-def push_merged_dataset(dataset_dict: DatasetDict, repo_name: str, env_token_key: str = "HF_TOKEN"):
+def push_merged_dataset(
+    dataset_dict: DatasetDict, repo_name: str, env_token_key: str = "HF_TOKEN"
+):
     load_dotenv()
     token = os.getenv(env_token_key)
     if not token:
-        raise ValueError(f"Hugging Face token not found in environment variable '{env_token_key}'")
+        raise ValueError(
+            f"Hugging Face token not found in environment variable '{env_token_key}'"
+        )
 
     logger.info(f"Pushing merged dataset to {repo_name}...")
     dataset_dict.push_to_hub(
-        repo_name,
-        token=token,
-        commit_message="Merged OpenQA datasets"
+        repo_name, token=token, commit_message="Merged OpenQA datasets"
     )
     logger.info("✅ Successfully pushed merged dataset!")
 
@@ -64,7 +72,7 @@ def main():
         "RikoteMaster/OpenCodeTreated",
         "jRikoteMaster/OpenMathTreated",
         "jonlecumberri/stackexchange_engineering_openqa",
-        "jonlecumberri/camel_chemistry_openqa"
+        "jonlecumberri/camel_chemistry_openqa",
     ]
 
     repo_name = "jonlecumberri/openqa_merged"

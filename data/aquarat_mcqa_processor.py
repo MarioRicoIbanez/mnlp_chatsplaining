@@ -17,6 +17,7 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 class AquaRATProcessor(BaseDatasetProcessor):
     """Processor for the AQUA-RAT dataset."""
 
@@ -55,7 +56,9 @@ class AquaRATProcessor(BaseDatasetProcessor):
     def _process_item(self, item: Dict) -> Dict:
         try:
             question = item["question"].strip()
-            raw_choices = [c.strip() for c in item.get("options", []) if isinstance(c, str)]
+            raw_choices = [
+                c.strip() for c in item.get("options", []) if isinstance(c, str)
+            ]
             choices = [self._normalize_choice(opt) for opt in raw_choices]
 
             answer_letter = item.get("correct", "").strip()
@@ -74,7 +77,7 @@ class AquaRATProcessor(BaseDatasetProcessor):
                 "answer_index": answer_index,
                 "answer_text": choices[answer_index],
                 "source": "aqua_rat",
-                "explanation": item.get("rationale", "").strip()
+                "explanation": item.get("rationale", "").strip(),
             }
         except Exception as e:
             logger.warning(f"Error processing item: {e}\nRaw item: {item}")
@@ -84,16 +87,16 @@ class AquaRATProcessor(BaseDatasetProcessor):
         load_dotenv()
         token = os.getenv(env_token_key)
         if not token:
-            raise ValueError(f"Hugging Face token not found in environment variable '{env_token_key}'")
+            raise ValueError(
+                f"Hugging Face token not found in environment variable '{env_token_key}'"
+            )
 
         logger.info("Processing AQUA-RAT dataset for train split...")
         train_data, _, _ = self.process_dataset()
 
         logger.info(f"Processed {len(train_data)} training examples")
 
-        dataset_dict = DatasetDict({
-            "train": Dataset.from_list(train_data)
-        })
+        dataset_dict = DatasetDict({"train": Dataset.from_list(train_data)})
 
         logger.info(f"Pushing dataset to {repo_name}...")
         try:
@@ -103,9 +106,11 @@ class AquaRATProcessor(BaseDatasetProcessor):
             logger.error(f"Failed to push to hub: {e}")
             raise
 
+
 def main():
     processor = AquaRATProcessor()
     processor.push_to_hub("jonlecumberri/aqua_rat_mcqa")
+
 
 if __name__ == "__main__":
     main()

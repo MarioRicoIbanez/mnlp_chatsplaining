@@ -8,10 +8,16 @@ from datasets import Dataset, DatasetDict
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 class BaseOpenQAProcessor(ABC):
     """Base class for all open-answer dataset processors."""
 
-    def __init__(self, output_dir: str = "output", hf_repo: Optional[str] = None, hf_subset: Optional[str] = None):
+    def __init__(
+        self,
+        output_dir: str = "output",
+        hf_repo: Optional[str] = None,
+        hf_subset: Optional[str] = None,
+    ):
         """
         Initialize the dataset processor.
 
@@ -61,7 +67,7 @@ class BaseOpenQAProcessor(ABC):
         }
         """
         required_fields = {"question", "answer", "source"}
-        
+
         for item in data:
             if not all(field in item for field in required_fields):
                 logger.error(f"Missing required fields in item: {item}")
@@ -75,10 +81,12 @@ class BaseOpenQAProcessor(ABC):
             if not isinstance(item["source"], str):
                 logger.error(f"Invalid source: {item['source']}")
                 return False
-        
+
         return True
 
-    def create_dataset_dict(self, train_data: List[Dict], val_data: List[Dict], test_data: List[Dict]) -> DatasetDict:
+    def create_dataset_dict(
+        self, train_data: List[Dict], val_data: List[Dict], test_data: List[Dict]
+    ) -> DatasetDict:
         """
         Create a DatasetDict from the processed data.
 
@@ -90,11 +98,13 @@ class BaseOpenQAProcessor(ABC):
         Returns:
             DatasetDict: Hugging Face dataset dictionary
         """
-        return DatasetDict({
-            "train": Dataset.from_list(train_data),
-            "validation": Dataset.from_list(val_data),
-            "test": Dataset.from_list(test_data)
-        })
+        return DatasetDict(
+            {
+                "train": Dataset.from_list(train_data),
+                "validation": Dataset.from_list(val_data),
+                "test": Dataset.from_list(test_data),
+            }
+        )
 
     def process_and_save(self) -> None:
         """
@@ -105,7 +115,9 @@ class BaseOpenQAProcessor(ABC):
         if not self.validate_openqa_format(train_data):
             raise ValueError("Training data does not follow the required OpenQA format")
         if not self.validate_openqa_format(val_data):
-            raise ValueError("Validation data does not follow the required OpenQA format")
+            raise ValueError(
+                "Validation data does not follow the required OpenQA format"
+            )
         if not self.validate_openqa_format(test_data):
             raise ValueError("Test data does not follow the required OpenQA format")
 

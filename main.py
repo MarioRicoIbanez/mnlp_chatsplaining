@@ -12,21 +12,45 @@ from dotenv import load_dotenv
 from torch.utils.data import DataLoader
 
 # Local imports
-from utils.dataset_utils import tokenize_func, SFTDataCollator, process_open_answer_dataset, process_mcq_dataset
+from utils.dataset_utils import (
+    tokenize_func,
+    SFTDataCollator,
+    process_open_answer_dataset,
+    process_mcq_dataset,
+)
 from utils.model_utils import load_model
 from utils.train_utils import plot_training_loss
-from utils.eval_utils import evaluate_openqa, evaluate_model_on_samples, load_mcqa_test_data, load_openqa_test_data
+from utils.eval_utils import (
+    evaluate_openqa,
+    evaluate_model_on_samples,
+    load_mcqa_test_data,
+    load_openqa_test_data,
+)
 from utils.batching import SmartPaddingTokenBatchSampler
 
+
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train and evaluate a language model')
-    parser.add_argument('--dataset', type=str, default="RikoteMaster/OpenQA_merged",
-                      help='Dataset to use for training (default: RikoteMaster/OpenQA_merged)')
-    parser.add_argument('--output_name', type=str, default="Qwen3-0.6B-SFT-aux",
-                      help='Name for output directory and HuggingFace push (default: Qwen3-0.6B-SFT-MCQA)')
-    parser.add_argument('--num_train_samples', type=int, default=None,
-                      help='Number of training samples to use (default: use full dataset)')
+    parser = argparse.ArgumentParser(description="Train and evaluate a language model")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="RikoteMaster/OpenQA_merged",
+        help="Dataset to use for training (default: RikoteMaster/OpenQA_merged)",
+    )
+    parser.add_argument(
+        "--output_name",
+        type=str,
+        default="Qwen3-0.6B-SFT-aux",
+        help="Name for output directory and HuggingFace push (default: Qwen3-0.6B-SFT-MCQA)",
+    )
+    parser.add_argument(
+        "--num_train_samples",
+        type=int,
+        default=None,
+        help="Number of training samples to use (default: use full dataset)",
+    )
     return parser.parse_args()
+
 
 # Get the directory where this script is located
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -39,32 +63,34 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
 HF_TOKEN = os.getenv("HF_TOKEN")
 if not HF_TOKEN:
-    logger.warning("HF_TOKEN not found in environment variables. Model pushing will be skipped.")
+    logger.warning(
+        "HF_TOKEN not found in environment variables. Model pushing will be skipped."
+    )
 
 
 def main():
     # Parse command line arguments
     args = parse_args()
-    
+
     # Create output directory based on output name
     output_dir = SCRIPT_DIR / args.output_name
     output_dir.mkdir(exist_ok=True)
-    
+
     logger.info(f"Using dataset: {args.dataset}")
     logger.info(f"Output name: {args.output_name}")
     logger.info(f"Output directory: {output_dir}")
-    
+
     # Clear any existing GPU cache
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    
+
     # 1. Model and Tokenizer Setup
     logger.info("Loading model and tokenizer...")
     model, tokenizer = load_model(model_name="Qwen/Qwen3-0.6B", load_in_4bit=False)
@@ -73,7 +99,7 @@ def main():
     # 2. Dataset Preparation with streaming and strict memory limits
     logger.info("Loading dataset from HuggingFace with streaming...")
     streaming_dataset = load_dataset(args.dataset, split="train", streaming=True)
-    
+
     # Convert streaming dataset to regular dataset
     logger.info("Converting dataset...")
     train_dataset = []
@@ -90,18 +116,18 @@ def main():
     if is_mcqa:
         logger.info("Processing MCQA dataset...")
         train_dataset = train_dataset.map(
-            process_mcq_dataset, 
+            process_mcq_dataset,
             fn_kwargs={"tokenizer": tokenizer},
             batch_size=1,  # Process one at a time
-            remove_columns=train_dataset.column_names
+            remove_columns=train_dataset.column_names,
         )
-    else: 
+    else:
         logger.info("Processing OpenAnswer dataset...")
         train_dataset = train_dataset.map(
-            process_open_answer_dataset, 
+            process_open_answer_dataset,
             fn_kwargs={"tokenizer": tokenizer},
-            batch_size=1,  # Process one at a time  
-            remove_columns=train_dataset.column_names
+            batch_size=1,  # Process one at a time
+            remove_columns=train_dataset.column_names,
         )
     # Print first 5 samples showing just the text field
     logger.info("\nFirst 5 text samples:")
@@ -110,16 +136,16 @@ def main():
         logger.info(f"SAMPLE {i+1}")
         logger.info(f"{'='*80}")
         # Access text directly from the dataset's text column
-        text = train_dataset['text'][i]
+        text = train_dataset["text"][i]
         logger.info(text)
         logger.info(f"{'-'*80}")
 
     logger.info("Tokenizing dataset...")
     tokenized_dataset = train_dataset.map(
-        tokenize_func, 
-        fn_kwargs={"tokenizer": tokenizer}, # Shorter sequences
+        tokenize_func,
+        fn_kwargs={"tokenizer": tokenizer},  # Shorter sequences
         batch_size=1,  # Process one at a time
-        remove_columns=train_dataset.column_names
+        remove_columns=train_dataset.column_names,
     )
 
     # Add sequence lengths to dataset
@@ -138,7 +164,9 @@ def main():
 
     # Set up token-budget batching
     max_tok_per_gpu = 8_000  # fits comfortably in 24 GB with bf16
-    sampler = SmartPaddingTokenBatchSampler(tokenized_dataset["length"], max_tok_per_gpu)
+    sampler = SmartPaddingTokenBatchSampler(
+        tokenized_dataset["length"], max_tok_per_gpu
+    )
 
     # Create custom dataloader
     dl = DataLoader(
@@ -161,26 +189,28 @@ def main():
         disable_tqdm=False,
         remove_unused_columns=True,
         gradient_checkpointing=True,  # Enable gradient checkpointing
-        max_grad_norm=1.0,           # Gradient clipping for stability
-        warmup_steps=1,              # Minimal warmup for small dataset
+        max_grad_norm=1.0,  # Gradient clipping for stability
+        warmup_steps=1,  # Minimal warmup for small dataset
     )
 
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=None,   # <- give None here…
+        train_dataset=None,  # <- give None here…
         data_collator=data_collator,
         tokenizer=tokenizer,
     )
 
-    trainer.train_dataset = tokenized_dataset   #  so metrics still work
+    trainer.train_dataset = tokenized_dataset  #  so metrics still work
     trainer.get_train_dataloader = lambda: dl
     # 4. Training
     trainer.train()
 
     logger.info("Pushing model to HuggingFace...")
     if HF_TOKEN:
-        trainer.model.push_to_hub(f"RikoteMaster/{args.output_name}", private=True, token=HF_TOKEN)
+        trainer.model.push_to_hub(
+            f"RikoteMaster/{args.output_name}", private=True, token=HF_TOKEN
+        )
         logger.info("Model pushed to HuggingFace successfully")
     else:
         logger.warning("Skipping model push to HuggingFace - no token provided")
@@ -208,11 +238,11 @@ def main():
 
     # 7. Evaluation based on dataset type
     logger.info("Loading test samples for evaluation...")
-    
+
     if is_mcqa:
         # For MCQA: Load from jonlecumberri/mcqa_merged test partition
         test_samples = load_mcqa_test_data(tokenizer=tokenizer, num_samples=6)
-        
+
         # Evaluate using MCQA evaluation function
         logger.info("Evaluating MCQA model...")
         evaluate_model_on_samples(
@@ -220,12 +250,12 @@ def main():
             tokenizer=tokenizer,
             test_samples=test_samples,
             max_new_tokens=2000,
-            temperature=0.7
+            temperature=0.7,
         )
     else:
         # For Open Answer: Load OpenCode and OpenMath samples
         test_samples = load_openqa_test_data(num_samples_per_dataset=3)
-        
+
         # Evaluate using OpenQA evaluation function
         logger.info("Evaluating OpenQA model...")
         evaluate_openqa(
@@ -233,15 +263,11 @@ def main():
             tokenizer=tokenizer,
             test_samples=test_samples,
             max_new_tokens=2000,
-            temperature=0.7
+            temperature=0.7,
         )
-    
+
     logger.info("Evaluation complete")
 
 
 if __name__ == "__main__":
     main()
-
-
-
-

@@ -2,6 +2,7 @@ import os
 import logging
 from typing import List, Dict
 from datasets import load_dataset, Dataset, DatasetDict, concatenate_datasets
+
 # from dotenv import load_dotenv
 from tqdm import tqdm  # Progress bar
 import statistics
@@ -12,13 +13,13 @@ logger = logging.getLogger(__name__)
 
 def get_text_length(example) -> Dict[str, int]:
     """Calculate combined length of answer and explanation in both characters and words."""
-    answer = str(example['answer'])
-    explanation = str(example['explanation'])
+    answer = str(example["answer"])
+    explanation = str(example["explanation"])
     combined_text = answer + " " + explanation
-    
+
     return {
         "char_length": len(combined_text),
-        "word_length": len(combined_text.split())
+        "word_length": len(combined_text.split()),
     }
 
 
@@ -50,17 +51,25 @@ def merge_datasets(dataset_paths: List[str]) -> DatasetDict:
                         # Add length columns
                         ds[split] = ds[split].map(lambda x: get_text_length(x))
                         # Sort by character length and select shortest examples
-                        ds[split] = ds[split].sort("char_length").select(range(MAX_EXAMPLES))
+                        ds[split] = (
+                            ds[split].sort("char_length").select(range(MAX_EXAMPLES))
+                        )
                         # Remove temporary length columns
-                        ds[split] = ds[split].remove_columns(["char_length", "word_length"])
-                        
+                        ds[split] = ds[split].remove_columns(
+                            ["char_length", "word_length"]
+                        )
+
                         # Calculate statistics
                         lengths = [get_text_length(x) for x in ds[split]]
-                        logger.info(f"   ⚠ Limited {path} {split} to {MAX_EXAMPLES} shortest examples")
+                        logger.info(
+                            f"   ⚠ Limited {path} {split} to {MAX_EXAMPLES} shortest examples"
+                        )
                         print_length_statistics(lengths, "char_length")
                         print_length_statistics(lengths, "word_length")
         except Exception as e:
-            logger.warning(f"⚠ Failed to load {path} normally. Trying streaming fallback... Error: {e}")
+            logger.warning(
+                f"⚠ Failed to load {path} normally. Trying streaming fallback... Error: {e}"
+            )
             try:
                 ds_stream = load_dataset(path, split="train", streaming=True)
                 # Use different limits based on dataset
@@ -69,20 +78,30 @@ def merge_datasets(dataset_paths: List[str]) -> DatasetDict:
                 ds = DatasetDict({"train": Dataset.from_list(examples)})
                 logger.info(f"   ✔ Fallback stream loaded: {len(examples)} examples")
             except Exception as e2:
-                logger.error(f"❌ Failed to load dataset {path} even via fallback: {e2}")
+                logger.error(
+                    f"❌ Failed to load dataset {path} even via fallback: {e2}"
+                )
                 continue
 
-        for split in tqdm(merged_splits, desc=f"→ Processing splits for {path}", leave=False):
+        for split in tqdm(
+            merged_splits, desc=f"→ Processing splits for {path}", leave=False
+        ):
             if split in ds:
                 try:
                     dataset_split = ds[split].remove_columns(
-                        [col for col in ds[split].column_names if col not in required_columns]
+                        [
+                            col
+                            for col in ds[split].column_names
+                            if col not in required_columns
+                        ]
                     )
                     dataset_split = dataset_split.select_columns(required_columns)
                     merged_splits[split].append(dataset_split)
                     logger.info(f"   ✔ {split}: {len(dataset_split)} examples")
                 except Exception as e:
-                    logger.warning(f"⚠ Failed to process split '{split}' in {path}: {e}")
+                    logger.warning(
+                        f"⚠ Failed to process split '{split}' in {path}: {e}"
+                    )
 
     logger.info("Concatenating splits...")
     merged_dataset = DatasetDict()
@@ -96,18 +115,20 @@ def merge_datasets(dataset_paths: List[str]) -> DatasetDict:
     return merged_dataset
 
 
-def push_merged_dataset(dataset_dict: DatasetDict, repo_name: str, env_token_key: str = "HF_TOKEN"):
+def push_merged_dataset(
+    dataset_dict: DatasetDict, repo_name: str, env_token_key: str = "HF_TOKEN"
+):
     # load_dotenv()
     # token = os.getenv(env_token_key)
     token = ""
     if not token:
-        raise ValueError(f"Hugging Face token not found in environment variable '{env_token_key}'")
+        raise ValueError(
+            f"Hugging Face token not found in environment variable '{env_token_key}'"
+        )
 
     logger.info(f"Pushing merged dataset to {repo_name}...")
     dataset_dict.push_to_hub(
-        repo_name,
-        token=token,
-        commit_message="Merged OpenQA datasets"
+        repo_name, token=token, commit_message="Merged OpenQA datasets"
     )
     logger.info("✅ Successfully pushed merged dataset!")
 
@@ -117,7 +138,7 @@ def main():
         "RikoteMaster/OpenCodeTreated",
         "RikoteMaster/OpenMathTreated",
         "jonlecumberri/stackexchange_engineering_openqa",
-        "jonlecumberri/camel_chemistry_openqa"
+        "jonlecumberri/camel_chemistry_openqa",
     ]
 
     repo_name = "RikoteMaster/OpenQA_merged"
@@ -128,4 +149,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

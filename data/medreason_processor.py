@@ -18,6 +18,7 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 class MedReasonProcessor(BaseDatasetProcessor):
     """Processor for the MedReason dataset."""
 
@@ -87,10 +88,12 @@ class MedReasonProcessor(BaseDatasetProcessor):
             return {
                 "question": question,
                 "choices": choices,
-                "answer_index": choices.index(answer) if answer in choices else -1,  # -1 if not found
+                "answer_index": (
+                    choices.index(answer) if answer in choices else -1
+                ),  # -1 if not found
                 "answer_text": answer,  # matchable answer only
                 "source": "medreason",
-                "explanation": reasoning_field.strip()
+                "explanation": reasoning_field.strip(),
             }
         except Exception as e:
             logger.warning(f"Error processing item: {e}\nRaw item: {item}")
@@ -100,15 +103,15 @@ class MedReasonProcessor(BaseDatasetProcessor):
         load_dotenv()
         token = os.getenv(env_token_key)
         if not token:
-            raise ValueError(f"Hugging Face token not found in environment variable '{env_token_key}'")
+            raise ValueError(
+                f"Hugging Face token not found in environment variable '{env_token_key}'"
+            )
         logger.info("Processing MedReason dataset for train split...")
         train_data, _, _ = self.process_dataset()
 
         logger.info(f"Processed {len(train_data)} training examples")
 
-        dataset_dict = DatasetDict({
-            "train": Dataset.from_list(train_data)
-        })
+        dataset_dict = DatasetDict({"train": Dataset.from_list(train_data)})
 
         logger.info(f"Pushing dataset to {repo_name}...")
         try:
@@ -118,10 +121,12 @@ class MedReasonProcessor(BaseDatasetProcessor):
             logger.error(f"Failed to push to hub: {e}")
             raise
 
+
 def main():
     processor = MedReasonProcessor()
-    #processor.process_and_save()
+    # processor.process_and_save()
     processor.push_to_hub("jonlecumberri/medreason_mcqa")
+
 
 if __name__ == "__main__":
 

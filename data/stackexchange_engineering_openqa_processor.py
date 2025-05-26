@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 if __name__ == "__main__":
     import sys
     from pathlib import Path
+
     sys.path.append(str(Path(__file__).parent.parent))
     from data.base_openans_processor import BaseOpenQAProcessor
 else:
@@ -42,20 +43,22 @@ class StackExchangeEngineeringOpenAnswerProcessor(BaseOpenQAProcessor):
             # if not question or not answer:
             #     continue
 
-            openqa_data.append({
-                "question": question,
-                "answer": answer,
-                "source": "stackexchange_engineering",
-                "explanation": ""  # No explanation field provided
-            })
+            openqa_data.append(
+                {
+                    "question": question,
+                    "answer": answer,
+                    "source": "stackexchange_engineering",
+                    "explanation": "",  # No explanation field provided
+                }
+            )
 
         logger.info(f"Collected {len(openqa_data)} open-answer examples")
 
         # Shuffle and split
         n = len(openqa_data)
-        train_data = openqa_data[:int(0.9 * n)]
-        val_data = openqa_data[int(0.9 * n):int(0.95 * n)]
-        test_data = openqa_data[int(0.95 * n):]
+        train_data = openqa_data[: int(0.9 * n)]
+        val_data = openqa_data[int(0.9 * n) : int(0.95 * n)]
+        test_data = openqa_data[int(0.95 * n) :]
 
         return train_data, val_data, test_data
 
@@ -63,7 +66,9 @@ class StackExchangeEngineeringOpenAnswerProcessor(BaseOpenQAProcessor):
         load_dotenv()
         token = os.getenv(env_token_key)
         if not token:
-            raise ValueError(f"Hugging Face token not found in environment variable '{env_token_key}'")
+            raise ValueError(
+                f"Hugging Face token not found in environment variable '{env_token_key}'"
+            )
 
         logger.info("Processing and validating OpenQA dataset...")
         train_data, val_data, test_data = self.process_dataset()
@@ -81,7 +86,7 @@ class StackExchangeEngineeringOpenAnswerProcessor(BaseOpenQAProcessor):
         dataset_dict.push_to_hub(
             repo_name,
             token=token,
-            commit_message="Upload OpenQA version of StackExchange Engineering dataset"
+            commit_message="Upload OpenQA version of StackExchange Engineering dataset",
         )
         logger.info("✅ Successfully pushed OpenQA dataset!")
 

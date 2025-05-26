@@ -66,7 +66,9 @@ class UnifiedMCQAProcessor(BaseDatasetProcessor):
                 "answer_index": label_index,
                 "answer_text": choices[label_index],
                 "source": item.get("source_dataset", "unified-mcqa"),
-                "explanation": item.get("context", "")  # Optional: context as explanation
+                "explanation": item.get(
+                    "context", ""
+                ),  # Optional: context as explanation
             }
 
         except Exception as e:
@@ -77,14 +79,18 @@ class UnifiedMCQAProcessor(BaseDatasetProcessor):
         load_dotenv()
         token = os.getenv(env_token_key)
         if not token:
-            raise ValueError(f"Hugging Face token not found in environment variable '{env_token_key}'")
+            raise ValueError(
+                f"Hugging Face token not found in environment variable '{env_token_key}'"
+            )
 
         train_data, val_data, test_data = self.process_dataset()
 
         logger.info("Creating Hugging Face datasets...")
-        dataset_dict = DatasetDict({
-            "train": Dataset.from_list(train_data),
-        })
+        dataset_dict = DatasetDict(
+            {
+                "train": Dataset.from_list(train_data),
+            }
+        )
 
         logger.info(f"Pushing dataset to {repo_name}...")
         try:

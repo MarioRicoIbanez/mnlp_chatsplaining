@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 if __name__ == "__main__":
     import sys
     from pathlib import Path
+
     sys.path.append(str(Path(__file__).parent.parent))
     from data.base_openans_processor import BaseOpenQAProcessor
 else:
@@ -50,20 +51,24 @@ class MedReasonOpenAnswerProcessor(BaseOpenQAProcessor):
             choices = self._extract_choices(options_field)
 
             if len(choices) == 1:
-                openqa_data.append({
-                    "question": question,
-                    "answer": answer_field.strip(),  # full answer + explanation
-                    "source": "medreason_open",
-                    "explanation": explanation
-                })
+                openqa_data.append(
+                    {
+                        "question": question,
+                        "answer": answer_field.strip(),  # full answer + explanation
+                        "source": "medreason_open",
+                        "explanation": explanation,
+                    }
+                )
 
-        logger.info(f"Collected {len(openqa_data)} open-answer examples (1-choice only)")
+        logger.info(
+            f"Collected {len(openqa_data)} open-answer examples (1-choice only)"
+        )
 
         # Optional: shuffle and split
         n = len(openqa_data)
-        train_data = openqa_data[:int(0.9 * n)]
-        val_data = openqa_data[int(0.9 * n):int(0.95 * n)]
-        test_data = openqa_data[int(0.95 * n):]
+        train_data = openqa_data[: int(0.9 * n)]
+        val_data = openqa_data[int(0.9 * n) : int(0.95 * n)]
+        test_data = openqa_data[int(0.95 * n) :]
 
         return train_data, val_data, test_data
 
@@ -77,12 +82,13 @@ class MedReasonOpenAnswerProcessor(BaseOpenQAProcessor):
         matches = re.findall(pattern, options_field + "\n")  # ensure trailing newline
         return matches
 
-
     def push_to_hub(self, repo_name: str, env_token_key: str = "HF_TOKEN"):
         load_dotenv()
         token = os.getenv(env_token_key)
         if not token:
-            raise ValueError(f"Hugging Face token not found in environment variable '{env_token_key}'")
+            raise ValueError(
+                f"Hugging Face token not found in environment variable '{env_token_key}'"
+            )
 
         logger.info("Processing and validating OpenQA dataset...")
         train_data, val_data, test_data = self.process_dataset()
@@ -100,7 +106,7 @@ class MedReasonOpenAnswerProcessor(BaseOpenQAProcessor):
         dataset_dict.push_to_hub(
             repo_name,
             token=token,
-            commit_message="Upload 1-choice open-answer questions from MedReason"
+            commit_message="Upload 1-choice open-answer questions from MedReason",
         )
         logger.info("✅ Successfully pushed OpenQA dataset!")
 

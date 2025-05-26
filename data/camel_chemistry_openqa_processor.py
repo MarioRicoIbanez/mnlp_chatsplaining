@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 if __name__ == "__main__":
     import sys
     from pathlib import Path
+
     sys.path.append(str(Path(__file__).parent.parent))
     from data.base_openans_processor import BaseOpenQAProcessor
 else:
@@ -47,20 +48,22 @@ class OpenAnswerProcessor(BaseOpenQAProcessor):
             # if not answer:
             #     continue
 
-            data.append({
-                "question": question,
-                "answer": solution,
-                "explanation": explanation,
-                "source": "camel_chemistry_seed_science_20K"
-            })
+            data.append(
+                {
+                    "question": question,
+                    "answer": solution,
+                    "explanation": explanation,
+                    "source": "camel_chemistry_seed_science_20K",
+                }
+            )
 
         logger.info(f"Collected {len(data)} open-answer examples")
         random.shuffle(data)
 
         n = len(data)
-        train_data = data[:int(0.9 * n)]
-        val_data = data[int(0.9 * n):int(0.95 * n)]
-        test_data = data[int(0.95 * n):]
+        train_data = data[: int(0.9 * n)]
+        val_data = data[int(0.9 * n) : int(0.95 * n)]
+        test_data = data[int(0.95 * n) :]
 
         return train_data, val_data, test_data
 
@@ -68,29 +71,37 @@ class OpenAnswerProcessor(BaseOpenQAProcessor):
         load_dotenv()
         token = os.getenv(env_token_key)
         if not token:
-            raise ValueError(f"Hugging Face token not found in environment variable '{env_token_key}'")
+            raise ValueError(
+                f"Hugging Face token not found in environment variable '{env_token_key}'"
+            )
 
         logger.info("Processing dataset...")
         train_data, val_data, test_data = self.process_dataset()
 
         logger.info("Validating format...")
-        for split_name, split_data in zip(["train", "validation", "test"], [train_data, val_data, test_data]):
+        for split_name, split_data in zip(
+            ["train", "validation", "test"], [train_data, val_data, test_data]
+        ):
             for item in split_data:
                 if not all(k in item for k in ["question", "answer", "source"]):
-                    raise ValueError(f"Missing required fields in {split_name} data: {item}")
+                    raise ValueError(
+                        f"Missing required fields in {split_name} data: {item}"
+                    )
 
         logger.info("Creating Hugging Face DatasetDict...")
-        dataset_dict = DatasetDict({
-            "train": Dataset.from_list(train_data),
-            "validation": Dataset.from_list(val_data),
-            "test": Dataset.from_list(test_data)
-        })
+        dataset_dict = DatasetDict(
+            {
+                "train": Dataset.from_list(train_data),
+                "validation": Dataset.from_list(val_data),
+                "test": Dataset.from_list(test_data),
+            }
+        )
 
         logger.info(f"Pushing to Hugging Face Hub at: {repo_name}...")
         dataset_dict.push_to_hub(
             repo_name,
             token=token,
-            commit_message="Upload CAMEL Chemistry dataset in OpenQA format"
+            commit_message="Upload CAMEL Chemistry dataset in OpenQA format",
         )
         logger.info("✅ Successfully pushed to Hugging Face Hub!")
 

@@ -5,7 +5,6 @@ clear and easily editable.  It follows the ChatML format we discussed,
 including the `<think>` block for chain‑of‑thought.
 """
 
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -69,9 +68,12 @@ _ASSISTANT_END = "\n<|im_end|>"
 # Public helpers
 # ---------------------------------------------------------------------------
 
+
 def build_prompt_section(question: str, choices_block: str) -> str:
     """Return the system + user blocks ready for concatenation."""
-    return _SYSTEM_BLOCK + _USER_TMPL.render(question=question, choices_block=choices_block)
+    return _SYSTEM_BLOCK + _USER_TMPL.render(
+        question=question, choices_block=choices_block
+    )
 
 
 def process_mcq_dataset(
@@ -98,7 +100,9 @@ def process_mcq_dataset(
     # --- 1. Choices block ---------------------------------------------------
     choices_val = row["choices"]
     if isinstance(choices_val, (list, tuple)):
-        choices_block = "\n".join(f"{chr(65 + i)}. {opt}" for i, opt in enumerate(choices_val))
+        choices_block = "\n".join(
+            f"{chr(65 + i)}. {opt}" for i, opt in enumerate(choices_val)
+        )
     else:
         choices_block = str(choices_val)
 
@@ -123,8 +127,9 @@ def process_mcq_dataset(
     return {
         "prompt": prompt,
         "text": text,
-        "prompt_len": prompt_len,      # 
+        "prompt_len": prompt_len,  #
     }
+
 
 def process_open_answer_dataset(
     row: Dict[str, str],
@@ -148,7 +153,11 @@ def process_open_answer_dataset(
     """
 
     # --- 1. Prompt (system+user+assistant header) ---------------------------
-    prompt = _SYSTEM_BLOCK + _OPEN_ANSWER_TMPL.render(question=row["question"]) + _ASSISTANT_START
+    prompt = (
+        _SYSTEM_BLOCK
+        + _OPEN_ANSWER_TMPL.render(question=row["question"])
+        + _ASSISTANT_START
+    )
 
     # --- 2. Assistant body --------------------------------------------------
     assistant_body = _ASSISTANT_BODY_TMPL.render(
@@ -176,9 +185,8 @@ def tokenize_func(ex, tokenizer):
     # Tokenize with truncation - using 8192 tokens to accommodate long explanations
     # Qwen models support up to 8192 tokens
     tok = tokenizer(ex["text"], truncation=True, max_length=8_192)
-    tok["prompt_len"] = ex["prompt_len"]          # keep for masking later
+    tok["prompt_len"] = ex["prompt_len"]  # keep for masking later
     return tok
-
 
 
 class SFTDataCollator:
@@ -190,34 +198,42 @@ class SFTDataCollator:
             # Handle single sample case (batch_size=1)
             if len(batch) == 1:
                 b = batch[0]
-                input_ids = torch.tensor(b["input_ids"], dtype=torch.long).unsqueeze(0)  # Add batch dimension
+                input_ids = torch.tensor(b["input_ids"], dtype=torch.long).unsqueeze(
+                    0
+                )  # Add batch dimension
                 attention_mask = torch.ones_like(input_ids)
                 labels = input_ids.clone()
                 # Mask out prompt part if prompt_len exists
                 if "prompt_len" in b:
-                    labels[0, :b["prompt_len"]] = -100  # ignore prompt tokens in loss
+                    labels[0, : b["prompt_len"]] = -100  # ignore prompt tokens in loss
             else:
                 # Convert list of tokenized samples to padded tensor batch
-                input_ids_list = [torch.tensor(b["input_ids"], dtype=torch.long) for b in batch]
-                input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-                
+                input_ids_list = [
+                    torch.tensor(b["input_ids"], dtype=torch.long) for b in batch
+                ]
+                input_ids = torch.nn.utils.rnn.pad_sequence(
+                    input_ids_list,
+                    batch_first=True,
+                    padding_value=self.tokenizer.pad_token_id,
+                )
+
                 # Attention mask: 1 for real tokens, 0 for pad
                 attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
-                
+
                 # Create labels (copy of input_ids)
                 labels = input_ids.clone()
-                
+
                 # Mask out prompt part if prompt_len exists
                 for i, b in enumerate(batch):
                     if "prompt_len" in b:
                         prompt_len = b["prompt_len"]  # length of prompt in tokens
                         labels[i, :prompt_len] = -100  # ignore prompt tokens in loss
-            
+
             # Move tensors to CPU if they're not needed on GPU immediately
             return {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
-                "labels": labels
+                "labels": labels,
             }
         except Exception as e:
             # Log the error and batch information for debugging
