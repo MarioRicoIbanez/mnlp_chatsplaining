@@ -7,7 +7,7 @@ def load_model(
     hf_token: str = None,
     use_fast_tokenizer: bool = True,
     trust_remote_code: bool = True,
-    device_map: str = "auto",
+    device_map: str = "cuda:0",
     torch_dtype: torch.dtype = torch.bfloat16,
     use_cache: bool = False,
     pretraining_tp: int = 1,

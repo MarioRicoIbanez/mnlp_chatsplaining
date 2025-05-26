@@ -3,20 +3,39 @@ import logging
 import os
 from pathlib import Path
 import torch
+import argparse
 
 # Third-party imports
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from transformers import TrainingArguments, Trainer
+from dotenv import load_dotenv
+from torch.utils.data import DataLoader
 
 # Local imports
-from utils.dataset_utils import process_mcq_dataset, tokenize_func, SFTDataCollator
+from utils.dataset_utils import tokenize_func, SFTDataCollator, process_open_answer_dataset, process_mcq_dataset
 from utils.model_utils import load_model
 from utils.train_utils import plot_training_loss
+from utils.eval_utils import evaluate_openqa, evaluate_model_on_samples, load_mcqa_test_data, load_openqa_test_data
+from utils.batching import SmartPaddingTokenBatchSampler
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train and evaluate a language model')
+    parser.add_argument('--dataset', type=str, default="RikoteMaster/OpenQA_merged",
+                      help='Dataset to use for training (default: RikoteMaster/OpenQA_merged)')
+    parser.add_argument('--output_name', type=str, default="Qwen3-0.6B-SFT-aux",
+                      help='Name for output directory and HuggingFace push (default: Qwen3-0.6B-SFT-MCQA)')
+    parser.add_argument('--num_train_samples', type=int, default=None,
+                      help='Number of training samples to use (default: use full dataset)')
+    return parser.parse_args()
 
 # Get the directory where this script is located
 SCRIPT_DIR = Path(__file__).parent.absolute()
 FIGS_DIR = SCRIPT_DIR / "figs"
 
+# Load environment variables from .env file
+load_dotenv()
+
+# Get HuggingFace token from environment
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -25,137 +44,200 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+HF_TOKEN = os.getenv("HF_TOKEN")
+if not HF_TOKEN:
+    logger.warning("HF_TOKEN not found in environment variables. Model pushing will be skipped.")
+
+
 def main():
-    logger.info("Starting training process...")
+    # Parse command line arguments
+    args = parse_args()
+    
+    # Create output directory based on output name
+    output_dir = SCRIPT_DIR / args.output_name
+    output_dir.mkdir(exist_ok=True)
+    
+    logger.info(f"Using dataset: {args.dataset}")
+    logger.info(f"Output name: {args.output_name}")
+    logger.info(f"Output directory: {output_dir}")
+    
+    # Clear any existing GPU cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     # 1. Model and Tokenizer Setup
     logger.info("Loading model and tokenizer...")
     model, tokenizer = load_model(model_name="Qwen/Qwen3-0.6B", load_in_4bit=False)
     logger.info("Model and tokenizer loaded successfully")
 
-    # 2. Dataset Preparation
-    logger.info("Loading dataset from HuggingFace...")
-    train_dataset = load_dataset("RikoteMaster/sciq_treated_epfl_mcqa", split="train")
-    logger.info(f"Dataset loaded with {len(train_dataset)} examples")
+    # 2. Dataset Preparation with streaming and strict memory limits
+    logger.info("Loading dataset from HuggingFace with streaming...")
+    streaming_dataset = load_dataset(args.dataset, split="train", streaming=True)
     
-    if "choices" in train_dataset.column_names:
-        # logger.info("Selecting first 100 examples for DEBUGGING...")
-        # train_dataset = train_dataset.select(range(100))
-        train_dataset = train_dataset.map(process_mcq_dataset, fn_kwargs={"tokenizer": tokenizer})
+    # Convert streaming dataset to regular dataset
+    logger.info("Converting dataset...")
+    train_dataset = []
+    for i, example in enumerate(streaming_dataset):
+        if args.num_train_samples is not None and i >= args.num_train_samples:
+            break
+        train_dataset.append(example)
+    train_dataset = Dataset.from_list(train_dataset)
+    logger.info(f"Processing {len(train_dataset)} examples")
 
+    # Process with memory-efficient mapping
+    logger.info("Processing dataset...")
+    is_mcqa = "choices" in train_dataset.column_names
+    if is_mcqa:
+        logger.info("Processing MCQA dataset...")
+        train_dataset = train_dataset.map(
+            process_mcq_dataset, 
+            fn_kwargs={"tokenizer": tokenizer},
+            batch_size=1,  # Process one at a time
+            remove_columns=train_dataset.column_names
+        )
+    else: 
+        logger.info("Processing OpenAnswer dataset...")
+        train_dataset = train_dataset.map(
+            process_open_answer_dataset, 
+            fn_kwargs={"tokenizer": tokenizer},
+            batch_size=1,  # Process one at a time  
+            remove_columns=train_dataset.column_names
+        )
+    # Print first 5 samples showing just the text field
+    logger.info("\nFirst 5 text samples:")
+    for i in range(5):
+        logger.info(f"\n{'='*80}")
+        logger.info(f"SAMPLE {i+1}")
+        logger.info(f"{'='*80}")
+        # Access text directly from the dataset's text column
+        text = train_dataset['text'][i]
+        logger.info(text)
+        logger.info(f"{'-'*80}")
+
+    logger.info("Tokenizing dataset...")
     tokenized_dataset = train_dataset.map(
         tokenize_func, 
-        fn_kwargs={"tokenizer": tokenizer}, 
+        fn_kwargs={"tokenizer": tokenizer}, # Shorter sequences
+        batch_size=1,  # Process one at a time
         remove_columns=train_dataset.column_names
     )
+
+    # Add sequence lengths to dataset
+    logger.info("Computing sequence lengths...")
+    tokenized_dataset = tokenized_dataset.map(
+        lambda ex: {"length": len(ex["input_ids"])},
+        num_proc=4,  # speeds it up
+    )
+
+    # Sort dataset by length
+    logger.info("Sorting dataset by sequence length...")
+    tokenized_dataset = tokenized_dataset.sort("length", reverse=True)
 
     # 3. Training Setup
     data_collator = SFTDataCollator(tokenizer=tokenizer)
 
+    # Set up token-budget batching
+    max_tok_per_gpu = 8_000  # fits comfortably in 24 GB with bf16
+    sampler = SmartPaddingTokenBatchSampler(tokenized_dataset["length"], max_tok_per_gpu)
+
+    # Create custom dataloader
+    dl = DataLoader(
+        tokenized_dataset,
+        batch_sampler=sampler,
+        collate_fn=data_collator,
+        num_workers=0,  # or >0 if RAM allows
+        pin_memory=False,
+    )
+
     training_args = TrainingArguments(
-        output_dir=str(SCRIPT_DIR / "qwen_sft_demo"),
+        output_dir=str(SCRIPT_DIR / output_dir),
         overwrite_output_dir=True,
         num_train_epochs=1,
-        per_device_train_batch_size=6,
-        gradient_accumulation_steps=1,
-        logging_steps=20,
-        save_steps=0,
-        report_to=[],
+        gradient_accumulation_steps=4,  # Increased for stability
+        logging_steps=20,  # More frequent logging for small dataset
+        save_steps=1000,
+        report_to="wandb",
         bf16=True,
         disable_tqdm=False,
-        remove_unused_columns=False,
+        remove_unused_columns=True,
+        gradient_checkpointing=True,  # Enable gradient checkpointing
+        max_grad_norm=1.0,           # Gradient clipping for stability
+        warmup_steps=1,              # Minimal warmup for small dataset
     )
 
     trainer = Trainer(
         model=model,
-        train_dataset=tokenized_dataset,
-        data_collator=data_collator,
         args=training_args,
+        train_dataset=None,   # <- give None here…
+        data_collator=data_collator,
+        tokenizer=tokenizer,
     )
-    logger.info("Trainer initialized successfully")
 
+    trainer.train_dataset = tokenized_dataset   #  so metrics still work
+    trainer.get_train_dataloader = lambda: dl
     # 4. Training
     trainer.train()
 
-    # 5. Plotting and Saving Results
+    logger.info("Pushing model to HuggingFace...")
+    if HF_TOKEN:
+        trainer.model.push_to_hub(f"RikoteMaster/{args.output_name}", private=True, token=HF_TOKEN)
+        logger.info("Model pushed to HuggingFace successfully")
+    else:
+        logger.warning("Skipping model push to HuggingFace - no token provided")
+    # Clear GPU cache after training
+    torch.cuda.empty_cache()
+
+    # 5. Save model in results_model directory
+    results_model_dir = SCRIPT_DIR / "results_model" / args.output_name
+    results_model_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Saving model to results directory: {results_model_dir}")
+    model.save_pretrained(results_model_dir)
+    tokenizer.save_pretrained(results_model_dir)
+    logger.info("Model saved to results directory successfully")
+
+    # Save model in original output directory
+    logger.info("Saving model to output directory...")
+    model.save_pretrained(SCRIPT_DIR / output_dir)
+    tokenizer.save_pretrained(SCRIPT_DIR / output_dir)
+    logger.info("Model saved successfully")
+
+    # 6. Plotting and Saving Results
     logger.info("Generating and saving training loss plot...")
     plot_training_loss(trainer, FIGS_DIR)
     logger.info("Training loss plot saved successfully")
 
-    # 6. Evaluation on test dataset
-    logger.info("Loading test dataset for evaluation...")
-    test_dataset = load_dataset("RikoteMaster/sciq_treated_epfl_mcqa", split="test")
-    logger.info(f"Test dataset loaded with {len(test_dataset)} examples")
+    # 7. Evaluation based on dataset type
+    logger.info("Loading test samples for evaluation...")
     
-    # Process first 10 test samples for evaluation
-    logger.info("Evaluating model on first 10 test samples...")
-    test_samples = test_dataset.select(range(10))
-    processed_test_samples = test_samples.map(process_mcq_dataset, fn_kwargs={"tokenizer": tokenizer})
-    
-    print("\n" + "="*80)
-    print("EVALUATION: Model predictions vs Ground Truth")
-    print("="*80)
-    
-    correct_predictions = 0
-    total_predictions = 0
-    
-    for i, sample in enumerate(processed_test_samples):
-        print(f"\n--- SAMPLE {i+1} ---")
-        print(f"Question: {sample.get('question', 'N/A')}")
-        print(f"Choices: {sample.get('choices', 'N/A')}")
-        print(f"Ground Truth Answer: {sample.get('answer_text', 'N/A')}")
+    if is_mcqa:
+        # For MCQA: Load from jonlecumberri/mcqa_merged test partition
+        test_samples = load_mcqa_test_data(tokenizer=tokenizer, num_samples=6)
         
-        # Use only the prompt (without the answer) for generation
-        prompt_only = sample['prompt']
-        
-        # Tokenize and generate
-        inputs = tokenizer(prompt_only, return_tensors="pt").to(model.device)
-        
-        # Generate response
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs, 
-                max_new_tokens=200,
-                do_sample=True,
-                temperature=0.7,
-                pad_token_id=tokenizer.eos_token_id
-            )
-        
-        # Decode only the generated part (excluding the input prompt)
-        generated_text = tokenizer.decode(
-            output_ids[0][inputs['input_ids'].shape[1]:], 
-            skip_special_tokens=True
-        ).strip()
-        
-        print(f"\nModel Generated:")
-        print(f"'{generated_text}'")
-        
-        # Simple evaluation: check if the correct answer letter appears in generated text
-        ground_truth = sample.get('answer_text', '')
-        choices = sample.get('choices', [])
-        
-        if isinstance(choices, list) and ground_truth in choices:
-            correct_answer_index = choices.index(ground_truth)
-            correct_letter = chr(65 + correct_answer_index)  # A, B, C, D
-            
-            # Check if the correct letter appears in the generated response
-            is_correct = correct_letter in generated_text.upper()
-            correct_predictions += int(is_correct)
-            total_predictions += 1
-            
-            print(f"Expected Answer: {correct_letter}. {ground_truth}")
-            print(f"Prediction: {'✓ CORRECT' if is_correct else '✗ INCORRECT'}")
-        else:
-            print(f"Could not evaluate this sample")
-        
-        print("-" * 60)
-    
-    # Print overall accuracy
-    if total_predictions > 0:
-        accuracy = correct_predictions / total_predictions * 100
-        print(f"\nOVERALL ACCURACY: {correct_predictions}/{total_predictions} = {accuracy:.1f}%")
+        # Evaluate using MCQA evaluation function
+        logger.info("Evaluating MCQA model...")
+        evaluate_model_on_samples(
+            model=model,
+            tokenizer=tokenizer,
+            test_samples=test_samples,
+            max_new_tokens=2000,
+            temperature=0.7
+        )
     else:
-        print(f"\nCould not compute accuracy")
+        # For Open Answer: Load OpenCode and OpenMath samples
+        test_samples = load_openqa_test_data(num_samples_per_dataset=3)
+        
+        # Evaluate using OpenQA evaluation function
+        logger.info("Evaluating OpenQA model...")
+        evaluate_openqa(
+            model=model,
+            tokenizer=tokenizer,
+            test_samples=test_samples,
+            max_new_tokens=2000,
+            temperature=0.7
+        )
+    
+    logger.info("Evaluation complete")
+
 
 if __name__ == "__main__":
     main()

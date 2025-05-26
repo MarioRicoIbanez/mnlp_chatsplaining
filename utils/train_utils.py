@@ -25,3 +25,7 @@ def plot_training_loss(trainer: Trainer, figs_dir: Path) -> None:
     figs_dir.mkdir(exist_ok=True)
     plt.savefig(figs_dir / "loss_curve.png")
     plt.show() 
+
+
+
+
