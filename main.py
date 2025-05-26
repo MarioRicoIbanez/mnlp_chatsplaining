@@ -39,37 +39,18 @@ def main():
 
     # 2. Dataset Preparation with streaming and strict memory limits
     logger.info("Loading dataset from HuggingFace with streaming...")
-    streaming_dataset = load_dataset("RikoteMaster/OpenCodeTreated", split="train", streaming=True)
+    streaming_dataset = load_dataset("RikoteMaster/OpenQA_merged", split="train", streaming=True)
     
     # Convert streaming dataset to regular dataset with first 10 examples
     logger.info("Converting first 10 examples to regular dataset...")
     train_dataset = []
     for i, example in enumerate(streaming_dataset):
-        if i >= 10_000:
+        if i >= 1_000:
             break
         train_dataset.append(example)
     train_dataset = Dataset.from_list(train_dataset)
     logger.info(f"Processing {len(train_dataset)} examples")
-    
-    # Print token lengths for each example
-    print("\n" + "="*80)
-    print("TOKEN LENGTHS FOR FIRST 10 EXAMPLES")
-    print("="*80)
-    for i, example in enumerate(train_dataset):
-        # Tokenize explanation and answer separately
-        explanation_tokens = len(tokenizer(example.get("explanation", ""))["input_ids"])
-        answer_tokens = len(tokenizer(example.get("answer", ""))["input_ids"])
-        question_tokens = len(tokenizer(example.get("question", ""))["input_ids"])
-        
-        print(f"\nExample {i+1}:")
-        print(f"Question tokens: {question_tokens}")
-        print(f"Explanation tokens: {explanation_tokens}")
-        print(f"Answer tokens: {answer_tokens}")
-        print(f"Total tokens: {question_tokens + explanation_tokens + answer_tokens}")
-        print("-" * 60)
-        if i >= 10:
-            break
-    
+
     # Process with memory-efficient mapping
     logger.info("Processing dataset...")
     if "choices" in train_dataset.column_names:
@@ -105,8 +86,8 @@ def main():
         per_device_train_batch_size=2,
         gradient_accumulation_steps=4,  # Increased for stability
         logging_steps=5,  # More frequent logging for small dataset
-        save_steps=0,
-        report_to=[],
+        save_steps=1000,
+        report_to="wandb",
         bf16=True,
         disable_tqdm=False,
         remove_unused_columns=False,

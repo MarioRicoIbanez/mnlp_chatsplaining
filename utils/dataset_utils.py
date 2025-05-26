@@ -92,7 +92,7 @@ def process_mcq_dataset(
     Returns
     -------
     dict
-        ``{"prompt", "full_text", "prompt_len", "text"}``
+        ``{"prompt", "text", "prompt_len"``
     """
 
     # --- 1. Choices block ---------------------------------------------------
@@ -112,7 +112,7 @@ def process_mcq_dataset(
     )
 
     # --- 4. Full text -------------------------------------------------------
-    full_text = prompt + assistant_body + _ASSISTANT_END
+    text = prompt + assistant_body + _ASSISTANT_END
 
     # --- 5. Prompt length (optional) ---------------------------------------
     if tokenizer is not None:
@@ -122,7 +122,7 @@ def process_mcq_dataset(
 
     return {
         "prompt": prompt,
-        "full_text": full_text,
+        "text": text,
         "prompt_len": prompt_len,      # 
     }
 
@@ -144,7 +144,7 @@ def process_open_answer_dataset(
     Returns
     -------
     dict
-        ``{"prompt", "full_text", "prompt_len"}``
+        ``{"prompt", "text", "prompt_len"}``
     """
 
     # --- 1. Prompt (system+user+assistant header) ---------------------------
@@ -157,7 +157,7 @@ def process_open_answer_dataset(
     )
 
     # --- 3. Full text -------------------------------------------------------
-    full_text = prompt + assistant_body + _ASSISTANT_END
+    text = prompt + assistant_body + _ASSISTANT_END
 
     # --- 4. Prompt length (optional) ---------------------------------------
     if tokenizer is not None:
@@ -167,7 +167,7 @@ def process_open_answer_dataset(
 
     return {
         "prompt": prompt,
-        "full_text": full_text,
+        "text": text,
         "prompt_len": prompt_len,
     }
 
@@ -175,7 +175,7 @@ def process_open_answer_dataset(
 def tokenize_func(ex, tokenizer):
     # Tokenize with truncation - using 8192 tokens to accommodate long explanations
     # Qwen models support up to 8192 tokens
-    tok = tokenizer(ex["full_text"], truncation=True, max_length=8192)
+    tok = tokenizer(ex["text"], truncation=True, max_length=6_000)
     tok["prompt_len"] = ex["prompt_len"]          # keep for masking later
     return tok
 
