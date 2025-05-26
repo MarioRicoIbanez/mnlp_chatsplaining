@@ -34,10 +34,6 @@ FIGS_DIR = SCRIPT_DIR / "figs"
 load_dotenv()
 
 # Get HuggingFace token from environment
-HF_TOKEN = os.getenv("HF_TOKEN")
-if not HF_TOKEN:
-    logger.warning("HF_TOKEN not found in environment variables. Model pushing will be skipped.")
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +41,11 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+if not HF_TOKEN:
+    logger.warning("HF_TOKEN not found in environment variables. Model pushing will be skipped.")
+
 
 def main():
     # Parse command line arguments
