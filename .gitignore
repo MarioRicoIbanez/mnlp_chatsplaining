@@ -10,3 +10,5 @@ figs/
 *.pyzwz
 .env
 *.json
+
+wandb/

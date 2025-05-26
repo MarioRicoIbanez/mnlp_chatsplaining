@@ -1,12 +1,35 @@
 import os
 import logging
-from typing import List
+from typing import List, Dict
 from datasets import load_dataset, Dataset, DatasetDict, concatenate_datasets
 # from dotenv import load_dotenv
 from tqdm import tqdm  # Progress bar
+import statistics
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def get_text_length(example) -> Dict[str, int]:
+    """Calculate combined length of answer and explanation in both characters and words."""
+    answer = str(example['answer'])
+    explanation = str(example['explanation'])
+    combined_text = answer + " " + explanation
+    
+    return {
+        "char_length": len(combined_text),
+        "word_length": len(combined_text.split())
+    }
+
+
+def print_length_statistics(lengths: List[Dict[str, int]], metric: str):
+    """Print comprehensive statistics for a given metric."""
+    values = [x[metric] for x in lengths]
+    logger.info(f"   📊 {metric.replace('_', ' ').title()} Statistics:")
+    logger.info(f"      Min: {min(values):.2f}")
+    logger.info(f"      Max: {max(values):.2f}")
+    logger.info(f"      Mean: {statistics.mean(values):.2f}")
+    logger.info(f"      Median: {statistics.median(values):.2f}")
 
 
 def merge_datasets(dataset_paths: List[str]) -> DatasetDict:
@@ -20,12 +43,22 @@ def merge_datasets(dataset_paths: List[str]) -> DatasetDict:
         logger.info(f"Loading dataset: {path}")
         try:
             ds = load_dataset(path)
-            # Limit only OpenCode and OpenMath to 10k examples
+            # For OpenCode and OpenMath, select shortest examples
             if path in LIMITED_DATASETS:
                 for split in ds:
                     if len(ds[split]) > MAX_EXAMPLES:
-                        ds[split] = ds[split].select(range(MAX_EXAMPLES))
-                        logger.info(f"   ⚠ Limited {path} {split} to {MAX_EXAMPLES} examples")
+                        # Add length columns
+                        ds[split] = ds[split].map(lambda x: get_text_length(x))
+                        # Sort by character length and select shortest examples
+                        ds[split] = ds[split].sort("char_length").select(range(MAX_EXAMPLES))
+                        # Remove temporary length columns
+                        ds[split] = ds[split].remove_columns(["char_length", "word_length"])
+                        
+                        # Calculate statistics
+                        lengths = [get_text_length(x) for x in ds[split]]
+                        logger.info(f"   ⚠ Limited {path} {split} to {MAX_EXAMPLES} shortest examples")
+                        print_length_statistics(lengths, "char_length")
+                        print_length_statistics(lengths, "word_length")
         except Exception as e:
             logger.warning(f"⚠ Failed to load {path} normally. Trying streaming fallback... Error: {e}")
             try:
