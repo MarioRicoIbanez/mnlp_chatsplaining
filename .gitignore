@@ -13,3 +13,5 @@ figs/
 **Qwen**
 **results_model**
 wandb/
+RAG/
+**qwen**
