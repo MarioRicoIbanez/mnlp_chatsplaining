@@ -13,3 +13,7 @@ figs/
 **Qwen**
 **results_model**
 wandb/
+**qwen**
+**RAG**
+**_pycache_**
+**model**

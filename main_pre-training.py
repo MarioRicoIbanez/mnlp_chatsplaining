@@ -80,7 +80,7 @@ def main():
     args = parse_args()
 
     # Create output directory based on output name
-    output_dir = SCRIPT_DIR / args.output_name
+    output_dir = SCRIPT_DIR / "results_model" / args.output_name
     output_dir.mkdir(exist_ok=True)
 
     logger.info(f"Using dataset: {args.dataset}")
@@ -93,7 +93,9 @@ def main():
 
     # 1. Model and Tokenizer Setup
     logger.info("Loading model and tokenizer...")
-    model, tokenizer = load_model(model_name="Qwen/Qwen3-0.6B", load_in_4bit=False)
+    model, tokenizer = load_model(
+        model_name="RikoteMaster/Qwen3-0.6B-SFT-Open", load_in_4bit=False
+    )
     logger.info("Model and tokenizer loaded successfully")
 
     # 2. Dataset Preparation with streaming and strict memory limits
