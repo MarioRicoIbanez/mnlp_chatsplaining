@@ -38,7 +38,7 @@ def load_model(
     """
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
+        "Qwen/Qwen3-0.6B",
         use_fast=use_fast_tokenizer,
         trust_remote_code=trust_remote_code,
         token=hf_token,
