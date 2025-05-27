@@ -198,18 +198,18 @@ class SFTDataCollator:
             # Handle single sample case (batch_size=1)
             if len(batch) == 1:
                 b = batch[0]
-                input_ids = torch.tensor(b["input_ids"], dtype=torch.long).unsqueeze(
+                input_ids = torch.as_tensor(b["input_ids"], dtype=torch.long).unsqueeze(
                     0
                 )  # Add batch dimension
                 attention_mask = torch.ones_like(input_ids)
                 labels = input_ids.clone()
                 # Mask out prompt part if prompt_len exists
-                if "prompt_len" in b:
+                if "prompt_len" in b and b["prompt_len"] is not None:
                     labels[0, : b["prompt_len"]] = -100  # ignore prompt tokens in loss
             else:
                 # Convert list of tokenized samples to padded tensor batch
                 input_ids_list = [
-                    torch.tensor(b["input_ids"], dtype=torch.long) for b in batch
+                    torch.as_tensor(b["input_ids"], dtype=torch.long) for b in batch
                 ]
                 input_ids = torch.nn.utils.rnn.pad_sequence(
                     input_ids_list,
@@ -225,11 +225,21 @@ class SFTDataCollator:
 
                 # Mask out prompt part if prompt_len exists
                 for i, b in enumerate(batch):
-                    if "prompt_len" in b:
+                    if "prompt_len" in b and b["prompt_len"] is not None:
                         prompt_len = b["prompt_len"]  # length of prompt in tokens
                         labels[i, :prompt_len] = -100  # ignore prompt tokens in loss
+                
+                # Mask padding tokens in labels
+                labels[input_ids == self.tokenizer.pad_token_id] = -100
 
-            # Move tensors to CPU if they're not needed on GPU immediately
+            # Debugging: Check if we have valid labels for loss computation
+            valid_labels = (labels != -100).sum().item()
+            if valid_labels == 0:
+                print(f"WARNING: No valid labels found for loss computation!")
+                print(f"Input shape: {input_ids.shape}")
+                print(f"Labels shape: {labels.shape}")
+                print(f"Prompt lengths: {[b.get('prompt_len', 'None') for b in batch]}")
+
             return {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
