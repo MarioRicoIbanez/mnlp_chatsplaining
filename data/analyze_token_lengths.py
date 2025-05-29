@@ -110,7 +110,7 @@ def main():
 
         # Check available memory
         available_memory = psutil.virtual_memory().available / (
-            1024 * 1024 * 1024
+            512 * 512 * 512
         )  # in GB
         estimated_memory = dataset_size * 0.0001  # rough estimate: 0.1MB per example
         logger.warning(f"Available memory: {available_memory:.1f}GB")

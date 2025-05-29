@@ -1,63 +1,54 @@
 #!/usr/bin/env python3
 """
-RAG utilities for PDF processing and retrieval.
+RAG utilities for PDF processing and retrieval using LangChain components.
 Contains the PDFRAG class and helper functions for document processing.
 
 Performance optimizations included:
-- Modular design with PDF utilities separated into pdf_utils.py
+- LangChain document loaders and text splitters
+- Simplified vector store operations with FAISS
 - CUDA-safe multiprocessing configuration
 - Optimized memory usage and batch processing
-- Fast vector store operations for large document collections
+- Structured prompt templates for better LLM interaction
 
-PDF processing is now handled by pdf_utils.py module.
+PDF processing is handled by pdf_utils.py module using LangChain loaders.
 """
 
 import os
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 import multiprocessing as mp
 import logging
 import time
+import json
+from huggingface_hub import HfApi, create_repo
 
+# LangChain core components
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.messages import SystemMessage
+from langchain_core.prompts.chat import HumanMessagePromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+
+# LangChain community components
 from langchain_text_splitters import SentenceTransformersTokenTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.llms import HuggingFacePipeline
 
+# Traditional components
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 import torch
 
 # Import PDF utilities from the new pdf_utils module
 from .pdf_utils import (
     check_pymupdf_installation,
-    extract_text_from_single_pdf,
-    extract_text_from_multiple_pdfs,
+    extract_documents_from_single_pdf,
+    extract_documents_from_multiple_pdfs,
     find_rag_directory,
 )
 
 logger = logging.getLogger(__name__)
-
-
-class CustomEmbeddingWrapper:
-    """Wrapper to make custom SentenceTransformer models compatible with LangChain."""
-    
-    def __init__(self, model):
-        self.model = model
-        # Use the more robust method to get max sequence length
-        try:
-            self.max_seq_length = model.get_max_seq_length()
-        except (AttributeError, Exception):
-            # Fallback to the previous method if get_max_seq_length() is not available
-            self.max_seq_length = getattr(model, 'max_seq_length', 256)
-        
-    def embed_documents(self, texts):
-        # Let SentenceTransformer handle truncation internally
-        # The encode method automatically handles texts that exceed max_seq_length
-        return self.model.encode(texts, truncate_dim=None).tolist()
-        
-    def embed_query(self, text):
-        # Let SentenceTransformer handle truncation internally
-        return self.model.encode([text], truncate_dim=None)[0].tolist()
 
 
 def setup_multiprocessing_for_cuda():
@@ -95,8 +86,9 @@ class PDFRAG:
         rag_dir: Optional[Path] = None,
         results_dir: Optional[Path] = None,
         embeddings_dir_path: Optional[Path] = None,
+        chunks_output_dir: Optional[str] = None,  # New parameter
     ):
-        """Initialize PDF RAG system.
+        """Initialize PDF RAG system using LangChain components.
 
         Args:
             model_name: HuggingFace model name for the LLM
@@ -111,6 +103,7 @@ class PDFRAG:
             rag_dir: RAG directory path
             results_dir: Results directory path
             embeddings_dir_path: Embeddings directory path
+            chunks_output_dir: Directory to save JSONL files with chunks
         """
         logger.info(f"Loading model from HuggingFace: {model_name}")
         
@@ -151,21 +144,24 @@ class PDFRAG:
         # Store detected RAG directory for later use
         self.rag_dir = detected_rag_dir
 
-        # Initialize embeddings with GPU support
+        # Initialize embeddings with GPU support using LangChain HuggingFaceEmbeddings
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Using device: {device} for embeddings")
 
-        # Choose embedding model and determine model name for splitter
+        # Choose embedding model - simplified using HuggingFaceEmbeddings directly
         if use_custom_embedding and Path(custom_embedding_path).exists():
             logger.info(f"Using custom trained embedding model: {custom_embedding_path}")
-            # For custom models, we'll use sentence-transformers directly
-            from sentence_transformers import SentenceTransformer
-            self.custom_model = SentenceTransformer(custom_embedding_path)
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=custom_embedding_path,
+                model_kwargs={"device": device},
+                encode_kwargs={
+                    "device": device,
+                    "batch_size": 32,
+                    "truncate_dim": None,
+                },
+            )
             embedding_model_for_splitter = custom_embedding_path
-            
-            # Create a wrapper to make it compatible with LangChain
-            self.embeddings = CustomEmbeddingWrapper(self.custom_model)
-            logger.info("Custom embedding model loaded successfully")
+            logger.info("Custom embedding model loaded successfully via HuggingFaceEmbeddings")
         else:
             if use_custom_embedding:
                 logger.warning(f"Custom embedding model not found at {custom_embedding_path}, using default")
@@ -176,8 +172,8 @@ class PDFRAG:
                 model_kwargs={"device": device},
                 encode_kwargs={
                     "device": device,
-                    "batch_size": 32,  # Smaller batch for longer sequences
-                    "truncate_dim": None,  # Don't truncate
+                    "batch_size": 32,
+                    "truncate_dim": None,
                 },
             )
             embedding_model_for_splitter = embedding_model
@@ -242,35 +238,67 @@ class PDFRAG:
         # Create LangChain LLM
         self.llm = HuggingFacePipeline(pipeline=self.pipe)
 
-        # Create prompt template using ChatML format
-        self.system_block = "<|im_start|>system\nYou are a helpful assistant specialised in master‑level STEM.\n<|im_end|>\n"
-        self.user_template = """<|im_start|>user
+        # Initialize structured prompt template using LangChain ChatPromptTemplate
+        self.prompt_template = ChatPromptTemplate.from_messages([
+            SystemMessage(content="<|im_start|>system\nYou are a helpful assistant specialised in master‑level STEM.\n<|im_end|>"),
+            HumanMessagePromptTemplate.from_template(
+                """<|im_start|>user
 The following is a question about knowledge and skills in advanced master‑level STEM courses.
 
 Question: {question}
 
-Context information is below:
+Context information:
 {context}
-<|im_end|>"""
-        self.assistant_start = "<|im_start|>assistant\n <think>\n Okay, lets think."
-        self.assistant_end = "\n<|im_end|>"
+<|im_end|> <thinking> Okay, lets think."""
+            )
+        ])
+        
+        # For non-chat models, keep a simple template as fallback
+        self.simple_prompt_template = PromptTemplate.from_template(
+            """<|im_start|>system
+You are a helpful assistant specialised in master‑level STEM.
+<|im_end|>
 
-        logger.info("Model and components loaded")
+<|im_start|>user
+The following is a question about knowledge and skills in advanced master‑level STEM courses.
+
+Question: {question}
+
+Context information:
+{context}
+<|im_end|>
+
+<|im_start|>assistant
+<thinking> Okay, lets think."""
+        )
+
+        logger.info("Model and components loaded with LangChain integration")
         logger.info(f"RAG system ready with directory: {self.rag_dir}")
         logger.info(f"Using SentenceTransformersTokenTextSplitter with {self.embedding_chunk_size} tokens per chunk")
 
+        # Initialize chunks output directory
+        if chunks_output_dir is None:
+            chunks_output_dir = str(self.embeddings_dir / "chunks")
+        self.chunks_output_dir = Path(chunks_output_dir)
+        self.chunks_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize Hugging Face API
+        self.hf_api = HfApi()
+        
+        logger.info(f"Using chunks output directory: {self.chunks_output_dir}")
+
     def _load_vector_store(self):
-        """Load existing vector store if available."""
+        """Load existing vector store using LangChain FAISS methods."""
         index_path = self.embeddings_dir / "faiss_index"
         logger.info(f"Checking for vector store at: {index_path}")
 
         if index_path.exists():
             try:
-                logger.info("Loading existing vector store...")
+                logger.info("Loading existing vector store with LangChain FAISS...")
                 self.vector_store = FAISS.load_local(
                     str(index_path),
                     self.embeddings,
-                    allow_dangerous_deserialization=True,  # Add this flag for newer versions
+                    allow_dangerous_deserialization=True,
                 )
 
                 # Check if vector store actually loaded with data
@@ -296,11 +324,11 @@ Context information is below:
             logger.info("No existing vector store found")
 
     def _save_vector_store(self):
-        """Save vector store to disk."""
+        """Save vector store using LangChain FAISS methods."""
         if self.vector_store is not None:
             try:
                 index_path = self.embeddings_dir / "faiss_index"
-                logger.info("Saving vector store...")
+                logger.info("Saving vector store with LangChain FAISS...")
                 self.vector_store.save_local(str(index_path))
                 logger.info(
                     f"Vector store saved successfully with {self.vector_store.index.ntotal} vectors"
@@ -324,64 +352,152 @@ Context information is below:
                 f.write(f"{pdf}\n")
         logger.info(f"Saved {len(self.processed_pdfs)} processed PDFs")
 
-    def _chunk_text_data(
-        self, 
-        text_data: List[Any], 
-        splitter: SentenceTransformersTokenTextSplitter, 
-        is_training: bool = False
-    ) -> List[Any]:
-        """Chunk text data using the provided splitter.
-        
-        Responsibility: Pure chunking logic separated from extraction.
-        This function is always executed in the main process to avoid CUDA issues.
+    def _save_chunks_to_jsonl(self, chunks: List[Document], pdf_name: str, append: bool = True) -> str:
+        """Save chunks to a JSONL file.
         
         Args:
-            text_data: List of text data to chunk
-                - If is_training=False (vector store): [{"text": "...", "metadata": {...}}, ...]
-                - If is_training=True: ["page_text_1", "page_text_2", ...]
-            splitter: The SentenceTransformersTokenTextSplitter to use
-            is_training: Whether this is for training (affects input/output format)
+            chunks: List of Document objects to save
+            pdf_name: Name of the source PDF
+            append: Whether to append to existing file or create new
             
         Returns:
-            Chunked data in the same format as input:
-                - If is_training=False: [{"text": "chunk1", "metadata": {...}}, ...]
-                - If is_training=True: ["chunk1", "chunk2", ...]
+            Path to the saved JSONL file
         """
-        logger.debug(f"Chunking {len(text_data)} items with splitter (training={is_training})")
+        output_file = self.chunks_output_dir / "rag_chunks.jsonl"
+        mode = "a" if append and output_file.exists() else "w"
         
-        chunks = []
+        with open(output_file, mode, encoding="utf-8") as f:
+            for chunk in chunks:
+                # Convert Document to dict format
+                chunk_dict = {
+                    "text": chunk.page_content,
+                    "metadata": {
+                        "source": pdf_name,
+                        "page": chunk.metadata.get("page", "Unknown"),
+                        "book": chunk.metadata.get("book", "Unknown"),
+                        "chunk_index": chunk.metadata.get("chunk_index", 0)
+                    }
+                }
+                f.write(json.dumps(chunk_dict, ensure_ascii=False) + "\n")
         
-        if is_training:
-            # Training mode: input is ["text1", "text2", ...], output is ["chunk1", "chunk2", ...]
-            for page_text in text_data:
-                try:
-                    text_chunks = splitter.split_text(page_text)
-                    for chunk_text in text_chunks:
-                        if chunk_text.strip() and len(chunk_text.strip()) >= 50:  # Filter short chunks for training
-                            chunks.append(chunk_text.strip())
-                except Exception as e:
-                    logger.warning(f"Error chunking page text: {e}")
+        logger.info(f"Saved {len(chunks)} chunks from {pdf_name} to {output_file}")
+        return str(output_file)
+
+    def export_all_chunks_to_jsonl(self, output_filepath: Optional[str] = None) -> str:
+        """Export all chunks from processed PDFs to a single JSONL file.
+        
+        Args:
+            output_filepath: Optional custom path for the output file
+            
+        Returns:
+            Path to the generated JSONL file
+        """
+        if output_filepath is None:
+            output_filepath = str(self.chunks_output_dir / "all_rag_chunks.jsonl")
+        
+        # Get all PDFs from rag_dir
+        pdf_paths = list(self.rag_dir.glob("*.pdf"))
+        if not pdf_paths:
+            logger.error(f"No PDF files found in {self.rag_dir}")
+            return ""
+        
+        logger.info(f"Processing {len(pdf_paths)} PDFs for JSONL export")
+        
+        # Process each PDF and collect chunks
+        all_chunks = []
+        for pdf_path in pdf_paths:
+            try:
+                # Extract documents
+                documents = extract_documents_from_single_pdf(pdf_path)
+                if not documents:
                     continue
-        else:
-            # Vector store mode: input is [{"text": "...", "metadata": {...}}, ...]
-            for doc_data in text_data:
-                try:
-                    text_chunks = splitter.split_text(doc_data["text"])
-                    for chunk_text in text_chunks:
-                        if chunk_text.strip():  # Only add non-empty chunks
-                            chunks.append({
-                                "text": chunk_text.strip(), 
-                                "metadata": doc_data["metadata"]
-                            })
-                except Exception as e:
-                    logger.warning(f"Error chunking document: {e}")
-                    continue
+                
+                # Split into chunks
+                chunks = self.text_splitter_for_embedding.split_documents(documents)
+                all_chunks.extend(chunks)
+                
+                logger.info(f"Processed {pdf_path.name}: {len(chunks)} chunks")
+                
+            except Exception as e:
+                logger.error(f"Error processing {pdf_path.name}: {e}")
+                continue
         
-        logger.debug(f"Created {len(chunks)} chunks from {len(text_data)} input items")
-        return chunks
+        if not all_chunks:
+            logger.error("No chunks generated from PDFs")
+            return ""
+        
+        # Save all chunks to JSONL
+        with open(output_filepath, "w", encoding="utf-8") as f:
+            for chunk in all_chunks:
+                chunk_dict = {
+                    "text": chunk.page_content,
+                    "metadata": {
+                        "source": chunk.metadata.get("source", "Unknown"),
+                        "page": chunk.metadata.get("page", "Unknown"),
+                        "book": chunk.metadata.get("book", "Unknown"),
+                        "chunk_index": chunk.metadata.get("chunk_index", 0)
+                    }
+                }
+                f.write(json.dumps(chunk_dict, ensure_ascii=False) + "\n")
+        
+        logger.info(f"Exported {len(all_chunks)} chunks to {output_filepath}")
+        return output_filepath
+
+    def upload_chunks_to_huggingface(
+        self,
+        local_file_path: str,
+        repo_id: str,
+        hf_filename: str = "rag_document_chunks.jsonl",
+        repo_type: str = "dataset",
+        private: bool = True,
+        token: Optional[str] = None
+    ) -> bool:
+        """Upload chunks JSONL file to Hugging Face.
+        
+        Args:
+            local_file_path: Path to the local JSONL file
+            repo_id: Hugging Face repository ID (username/repo-name)
+            hf_filename: Name for the file in the HF repository
+            repo_type: Type of repository ("dataset" or "model")
+            private: Whether the repository should be private
+            token: Hugging Face API token (optional if logged in)
+            
+        Returns:
+            bool: True if upload was successful
+        """
+        try:
+            # Create repository if it doesn't exist
+            try:
+                create_repo(
+                    repo_id=repo_id,
+                    repo_type=repo_type,
+                    private=private,
+                    token=token,
+                    exist_ok=True
+                )
+                logger.info(f"Repository {repo_id} is ready")
+            except Exception as e:
+                logger.error(f"Error creating repository {repo_id}: {e}")
+                return False
+            
+            # Upload the file
+            self.hf_api.upload_file(
+                path_or_fileobj=local_file_path,
+                path_in_repo=hf_filename,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                token=token
+            )
+            
+            logger.info(f"Successfully uploaded {local_file_path} to {repo_id}/{hf_filename}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error uploading to Hugging Face: {e}")
+            return False
 
     def add_pdf(self, pdf_path: str):
-        """Add a PDF book to the vector store.
+        """Add a PDF book to the vector store using LangChain document processing pipeline.
 
         Args:
             pdf_path: Path to the PDF file
@@ -392,42 +508,35 @@ Context information is below:
             logger.info(f"Skipping already processed PDF: {pdf_name}")
             return
 
-        logger.info(f"Processing PDF: {pdf_path}")
-
-        # Step 1: Extract text from PDF using modular approach
-        page_data = extract_text_from_single_pdf(Path(pdf_path), include_metadata=True)
-
-        if not page_data:
-            logger.warning(f"No valid pages found in {pdf_name}")
-            return
-
-        # Step 2: Chunk text data using the modular chunking function
-        chunks_with_metadata = self._chunk_text_data(
-            page_data, self.text_splitter_for_embedding, is_training=False
-        )
-
-        if not chunks_with_metadata:
-            logger.warning(f"No valid chunks found in {pdf_name}")
-            return
-
-        logger.info(f"Processing {len(chunks_with_metadata)} chunks with SentenceTransformer tokenization...")
+        logger.info(f"Processing PDF with LangChain pipeline: {pdf_path}")
 
         try:
-            # Extract texts and metadatas for batch processing
-            texts = [chunk["text"] for chunk in chunks_with_metadata]
-            metadatas = [chunk["metadata"] for chunk in chunks_with_metadata]
+            # Step 1: Extract documents using LangChain loader
+            documents = extract_documents_from_single_pdf(Path(pdf_path))
 
-            # Create or update vector store with batch processing
+            if not documents:
+                logger.warning(f"No valid documents found in {pdf_name}")
+                return
+
+            # Step 2: Chunk documents using LangChain splitter
+            chunks = self.text_splitter_for_embedding.split_documents(documents)
+
+            if not chunks:
+                logger.warning(f"No valid chunks found in {pdf_name}")
+                return
+
+            # Save chunks to JSONL
+            self._save_chunks_to_jsonl(chunks, pdf_name)
+
+            # Step 3: Create or update vector store
             if self.vector_store is None:
-                logger.info("Creating new vector store...")
-                self.vector_store = FAISS.from_texts(
-                    texts, self.embeddings, metadatas=metadatas
-                )
+                logger.info("Creating new vector store with LangChain FAISS...")
+                self.vector_store = FAISS.from_documents(chunks, self.embeddings)
             else:
-                logger.info("Adding to existing vector store...")
-                self.vector_store.add_texts(texts, metadatas=metadatas)
+                logger.info("Adding to existing vector store with LangChain FAISS...")
+                self.vector_store.add_documents(chunks)
 
-            logger.info(f"Added {len(page_data)} pages ({len(chunks_with_metadata)} chunks) from {Path(pdf_path).stem}")
+            logger.info(f"Added {len(documents)} pages ({len(chunks)} chunks) from {Path(pdf_path).stem}")
 
             # Mark PDF as processed and save
             self.processed_pdfs.add(pdf_name)
@@ -447,7 +556,7 @@ Context information is below:
         score_threshold: Optional[float] = None,
         filter_metadata: Optional[Dict[str, Any]] = None,
     ) -> List[Dict]:
-        """Retrieve relevant documents with scores and metadata.
+        """Retrieve relevant documents with scores and metadata using LangChain FAISS.
 
         Args:
             query: The search query
@@ -467,7 +576,7 @@ Context information is below:
             return []
 
         try:
-            # Use similarity search with scores
+            # Use LangChain FAISS similarity search with scores
             docs_and_scores = self.vector_store.similarity_search_with_score(
                 query, k=k, filter=filter_metadata
             )
@@ -485,7 +594,7 @@ Context information is below:
                     f"INFO: {len(docs_and_scores)} documents after score filtering (threshold: {score_threshold})"
                 )
 
-            # Format results
+            # Format results - working with LangChain Document objects
             results = []
             for doc, score in docs_and_scores:
                 results.append(
@@ -513,51 +622,90 @@ Context information is below:
         score_threshold: Optional[float] = None,
         filter_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Generate an answer based on retrieved documents using ChatML format."""
-        # Retrieve relevant documents
-        retrieved = self.retrieve_documents(
-            question, k=k, score_threshold=score_threshold, filter_metadata=filter_metadata
-        )
-
-        if not retrieved:
+        """Generate an answer based on retrieved documents using LangChain RAG chain.
+        
+        Args:
+            question: The question to answer
+            k: Number of documents to retrieve
+            score_threshold: Optional minimum similarity score
+            filter_metadata: Optional metadata filters
+            
+        Returns:
+            Dictionary containing answer, sources, and scores
+        """
+        if self.vector_store is None:
+            logger.error("No vector store available for retrieval")
             return {
-                "answer": "I couldn't find any relevant information to answer your question.",
+                "answer": "Error: No vector store available. Please add some PDFs first.",
                 "sources": [],
                 "retrieval_scores": [],
-                "context_docs": 0,
+                "context_docs": 0
             }
 
-        # Format context from retrieved documents
-        context = "\n\n".join(
-            f"From {doc['book']} (Page {doc['page']}):\n{doc['content']}"
-            for doc in retrieved
-        )
-
-        # Create prompt using the ChatML format defined in __init__
-        user_prompt = self.user_template.format(question=question, context=context)
-        full_prompt = self.system_block + user_prompt + self.assistant_start
-
-        # Generate answer using invoke
-        response = self.llm.invoke(full_prompt)
-        
-        # Clean up the response to remove any thinking tokens or extra formatting
-        answer = response.strip()
-        if answer.startswith("<think>"):
-            # Find the end of thinking and extract the actual answer
-            think_end = answer.find("</think>")
-            if think_end != -1:
-                answer = answer[think_end + 8:].strip()
-        
-        # Remove any trailing end tokens
-        if answer.endswith(self.assistant_end.strip()):
-            answer = answer[:-len(self.assistant_end.strip())].strip()
-
-        return {
-            "answer": answer,
-            "sources": [doc["book"] for doc in retrieved],
-            "retrieval_scores": [doc["score"] for doc in retrieved],
-            "context_docs": len(retrieved),
-        }
+        try:
+            # Create retriever from vector store
+            retriever = self.vector_store.as_retriever(
+                search_type="similarity_score_threshold",
+                search_kwargs={
+                    'k': k,
+                    'score_threshold': score_threshold or self.similarity_threshold,
+                    'filter': filter_metadata
+                }
+            )
+            
+            # Format documents for context
+            def format_docs(docs):
+                return "\n\n".join(
+                    f"From {doc.metadata.get('book', 'Unknown')} (Page {doc.metadata.get('page', 'Unknown')}):\n{doc.page_content}"
+                    for doc in docs
+                )
+            
+            # Create answer generation chain that expects context and question
+            answer_generation_chain = (
+                self.prompt_template
+                | self.llm
+                | StrOutputParser()
+            )
+            
+            # Create complete RAG chain with proper data flow
+            rag_chain_with_sources = RunnableParallel(
+                {
+                    "context_docs": retriever,  # Raw documents from retriever
+                    "question": RunnablePassthrough()  # Original question
+                }
+            ).assign(
+                # Format retrieved documents for context
+                context=lambda x: format_docs(x["context_docs"])
+            ).assign(
+                # Generate answer using formatted context and question
+                answer=answer_generation_chain
+            )
+            
+            # Get answer and sources
+            result = rag_chain_with_sources.invoke(question)
+            
+            # Format sources
+            sources = []
+            for doc in result["context_docs"]:
+                sources.append(f"{doc.metadata.get('book', 'Unknown')} (Page {doc.metadata.get('page', 'Unknown')})")
+            
+            return {
+                "answer": result["answer"],
+                "sources": sources,
+                "retrieval_scores": [doc.metadata.get("score", 0.0) for doc in result["context_docs"]],
+                "context_docs": len(result["context_docs"])
+            }
+            
+        except Exception as e:
+            logger.error(f"Error generating answer: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "answer": f"Error generating answer: {str(e)}",
+                "sources": [],
+                "retrieval_scores": [],
+                "context_docs": 0
+            }
 
     def debug_vector_store(self):
         """Debug function to analyze vector store contents."""
@@ -649,21 +797,21 @@ Context information is below:
         return unprocessed_pdfs
 
     def add_multiple_pdfs(self, pdf_paths: List[str], max_workers: int = None, batch_size: int = 32, use_parallel: bool = True):
-        """Add multiple PDFs efficiently with automatic processing mode selection.
+        """Add multiple PDFs efficiently using LangChain document processing pipeline.
         
         This method provides a unified interface for processing multiple PDFs:
         - Parallel processing (default): Fast extraction using multiple workers
         - Sequential processing (fallback): Reliable single-threaded processing
         - CUDA-safe: All chunking happens in main process
-        - Efficient batching for vector store operations
-        
+        - Efficient batching for vector store operations using LangChain
+
         Args:
             pdf_paths: List of PDF file paths
             max_workers: Number of parallel workers (defaults to CPU count)
-            batch_size: Number of chunks to process in each batch
+            batch_size: Number of documents to process in each batch
             use_parallel: Whether to use parallel processing (default: True)
         """
-        logger.info(f"Processing {len(pdf_paths)} PDFs (parallel={use_parallel}, batch_size={batch_size})")
+        logger.info(f"Processing {len(pdf_paths)} PDFs with LangChain pipeline (parallel={use_parallel}, batch_size={batch_size})")
 
         # Filter out already processed PDFs
         unprocessed_pdfs = self._filter_unprocessed_pdfs(pdf_paths)
@@ -675,69 +823,67 @@ Context information is below:
         logger.info(f"Processing {len(unprocessed_pdfs)} new PDFs...")
         start_time = time.time()
 
-        # Step 1: Extract text from all PDFs
+        # Step 1: Extract documents from all PDFs
         if use_parallel:
-            logger.info(f"🚀 Using parallel extraction with {max_workers or 'auto'} workers")
+            logger.info(f"🚀 Using parallel extraction with LangChain loaders ({max_workers or 'auto'} workers)")
             try:
                 pdf_paths_as_path_objects = [Path(p) for p in unprocessed_pdfs]
-                all_page_data = extract_text_from_multiple_pdfs(
-                    pdf_paths_as_path_objects, include_metadata=True, max_workers=max_workers
+                all_documents = extract_documents_from_multiple_pdfs(
+                    pdf_paths_as_path_objects, max_workers=max_workers
                 )
             except Exception as e:
                 logger.warning(f"Parallel processing failed: {e}. Falling back to sequential...")
                 use_parallel = False
         
         if not use_parallel:
-            logger.info("📝 Using sequential extraction")
-            all_page_data = []
+            logger.info("📝 Using sequential extraction with LangChain loaders")
+            all_documents = []
             for pdf_path in unprocessed_pdfs:
                 try:
-                    page_data = extract_text_from_single_pdf(Path(pdf_path), include_metadata=True)
-                    all_page_data.extend(page_data)
-                    logger.info(f"Extracted {len(page_data)} pages from {Path(pdf_path).name}")
+                    documents = extract_documents_from_single_pdf(Path(pdf_path))
+                    all_documents.extend(documents)
+                    logger.info(f"Extracted {len(documents)} documents from {Path(pdf_path).name}")
                 except Exception as e:
                     logger.error(f"Error extracting from {Path(pdf_path).name}: {e}")
                     continue
 
-        if not all_page_data:
-            logger.warning("No valid page data extracted!")
+        if not all_documents:
+            logger.warning("No valid documents extracted!")
             return
 
-        logger.info(f"✅ Extracted {len(all_page_data)} pages total")
+        logger.info(f"✅ Extracted {len(all_documents)} documents total")
 
-        # Step 2: Chunk all text in main process
-        logger.info(f"📝 Chunking {len(all_page_data)} pages...")
-        chunks_with_metadata = self._chunk_text_data(
-            all_page_data, self.text_splitter_for_embedding, is_training=False
-        )
+        # Step 2: Chunk all documents using LangChain splitter
+        logger.info(f"📝 Chunking {len(all_documents)} documents with LangChain splitter...")
+        chunks = self.text_splitter_for_embedding.split_documents(all_documents)
 
-        if not chunks_with_metadata:
+        if not chunks:
             logger.warning("No valid chunks created!")
             return
 
-        logger.info(f"Created {len(chunks_with_metadata)} chunks")
+        logger.info(f"Created {len(chunks)} chunks")
 
-        # Step 3: Add chunks to vector store in batches
-        logger.info(f"💾 Adding {len(chunks_with_metadata)} chunks to vector store (batch_size={batch_size})")
+        # Step 3: Add chunks to vector store in batches using LangChain methods
+        logger.info(f"💾 Adding {len(chunks)} chunks to vector store (batch_size={batch_size})")
 
         try:
-            all_chunks = [chunk["text"] for chunk in chunks_with_metadata]
-            all_metadatas = [chunk["metadata"] for chunk in chunks_with_metadata]
-            
-            for i in range(0, len(all_chunks), batch_size):
-                batch_chunks = all_chunks[i:i + batch_size]
-                batch_metadatas = all_metadatas[i:i + batch_size]
+            # Process chunks in batches
+            for i in range(0, len(chunks), batch_size):
+                batch_chunks = chunks[i:i + batch_size]
+                
+                # Save batch chunks to JSONL
+                for chunk in batch_chunks:
+                    pdf_name = chunk.metadata.get("source", "Unknown")
+                    self._save_chunks_to_jsonl([chunk], pdf_name)
                 
                 if self.vector_store is None:
-                    logger.info("Creating new vector store...")
-                    self.vector_store = FAISS.from_texts(
-                        batch_chunks, self.embeddings, metadatas=batch_metadatas
-                    )
+                    logger.info("Creating new vector store with LangChain FAISS...")
+                    self.vector_store = FAISS.from_documents(batch_chunks, self.embeddings)
                 else:
                     batch_num = i//batch_size + 1
-                    total_batches = (len(all_chunks) + batch_size - 1)//batch_size
-                    logger.info(f"Adding batch {batch_num}/{total_batches}...")
-                    self.vector_store.add_texts(batch_chunks, metadatas=batch_metadatas)
+                    total_batches = (len(chunks) + batch_size - 1)//batch_size
+                    logger.info(f"Adding batch {batch_num}/{total_batches} with LangChain FAISS...")
+                    self.vector_store.add_documents(batch_chunks)
 
             # Mark all PDFs as processed
             processed_files = [Path(pdf_path).name for pdf_path in unprocessed_pdfs]
@@ -749,12 +895,163 @@ Context information is below:
 
             total_time = time.time() - start_time
             mode_str = "parallel" if use_parallel else "sequential"
-            logger.info(f"🎉 Successfully processed {len(processed_files)} PDFs with {len(all_chunks)} chunks")
-            logger.info(f"⏱️  Total time: {total_time:.2f}s | Speed: {len(all_chunks)/total_time:.2f} chunks/s ({mode_str})")
+            logger.info(f"🎉 Successfully processed {len(processed_files)} PDFs with {len(chunks)} chunks using LangChain")
+            logger.info(f"⏱️  Total time: {total_time:.2f}s | Speed: {len(chunks)/total_time:.2f} chunks/s ({mode_str})")
 
         except Exception as e:
             logger.error(f"Error adding chunks to vector store: {e}")
             raise
+
+    def _prepare_training_corpus_from_pdfs(self) -> List[str]:
+        """Prepare training corpus from PDF files using LangChain document processing pipeline.
+        
+        Returns:
+            List of text chunks suitable for training
+        """
+        pdf_paths = list(self.rag_dir.glob("*.pdf"))
+        if not pdf_paths:
+            logger.error(f"No PDF files found in {self.rag_dir}")
+            return []
+        
+        logger.info(f"Found {len(pdf_paths)} PDF files to process for training")
+        
+        # Step 1: Extract documents using LangChain loaders
+        all_documents = extract_documents_from_multiple_pdfs(pdf_paths, max_workers=None)
+
+        if not all_documents:
+            logger.warning("No documents extracted from PDFs for training")
+            return []
+
+        logger.info(f"Extracted {len(all_documents)} documents for training")
+
+        # Step 2: Chunk documents using LangChain splitter
+        training_chunks = []
+        for doc in all_documents:
+            try:
+                # Split each document's content
+                text_chunks = self.text_splitter_for_training.split_text(doc.page_content)
+                for chunk_text in text_chunks:
+                    if chunk_text.strip() and len(chunk_text.strip()) >= 50:  # Filter short chunks
+                        training_chunks.append(chunk_text.strip())
+            except Exception as e:
+                logger.warning(f"Error chunking document: {e}")
+                continue
+
+        logger.info(f"Prepared {len(training_chunks)} training chunks using LangChain pipeline")
+        return training_chunks
+
+    def streamlit_chat(self):
+        """Set up an interactive chat interface using Streamlit."""
+        # Import Streamlit dependencies only when needed
+        import streamlit as st
+        from streamlit_chat import message
+        import asyncio
+        import nest_asyncio
+
+        # Apply nest_asyncio to allow nested event loops
+        nest_asyncio.apply()
+
+        # Initialize session state for chat history and sources
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+        if "sources" not in st.session_state:
+            st.session_state.sources = {}
+        if "initialized" not in st.session_state:
+            st.session_state.initialized = False
+
+        # Set up the page
+        st.set_page_config(
+            page_title="PDF RAG Chat",
+            page_icon="📚",
+            layout="wide"
+        )
+
+        st.title("📚 PDF RAG Chat")
+        st.markdown("""
+        <style>
+        .stChatMessage { margin-bottom: 1.5em; }
+        .stButton>button { margin-top: 0.5em; }
+        .st-collapsed, .st-collapsible { background: #222 !important; color: #fff !important; }
+        </style>
+        """, unsafe_allow_html=True)
+        st.markdown("""
+        This chat interface allows you to ask questions about the content of your PDF documents.<br>
+        The system will retrieve relevant information and generate answers based on the context.
+        """, unsafe_allow_html=True)
+
+        # Initialize the system only once
+        if not st.session_state.initialized:
+            with st.spinner("Initializing system..."):
+                if self.vector_store is None:
+                    self._load_vector_store()
+                test_query = "test"
+                try:
+                    self.retrieve_documents(test_query, k=1)
+                    st.session_state.initialized = True
+                    st.success("System initialized successfully!")
+                except Exception as e:
+                    st.error(f"Error initializing system: {str(e)}")
+                    return
+
+        # Display chat history
+        for i, message_obj in enumerate(st.session_state.messages):
+            role = message_obj["role"]
+            content = message_obj["content"]
+            sources = message_obj.get("sources", None)
+            with st.chat_message(role):
+                st.markdown(content)
+                # Only for assistant, show sources if present
+                if role == "assistant" and sources:
+                    with st.expander("Show Sources", expanded=False):
+                        for src in sources:
+                            st.markdown(src)
+
+        # Chat input
+        prompt = st.chat_input("Ask a question about your PDFs")
+        if prompt:
+            # Add user message to chat history
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            # Generate response
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    try:
+                        result = self.generate_answer(prompt, score_threshold=0.5)
+                        response = result["answer"]
+                        sources = []
+                        for source, score in zip(result["sources"], result["retrieval_scores"]):
+                            sources.append(f"- {source} (Score: {score:.3f})")
+                        # Add assistant response to chat history, with sources
+                        st.session_state.messages.append({"role": "assistant", "content": response, "sources": sources})
+                        st.markdown(response)
+                        if sources:
+                            with st.expander("Show Sources", expanded=False):
+                                for src in sources:
+                                    st.markdown(src)
+                    except Exception as e:
+                        response = f"An error occurred: {str(e)}"
+                        st.session_state.messages.append({"role": "assistant", "content": response})
+                        st.error(response)
+
+        # Add a sidebar with information
+        with st.sidebar:
+            st.title("About")
+            st.markdown("""
+            This chat interface uses:
+            - PDF RAG system for document retrieval
+            - Advanced language model for answer generation
+            - Semantic search with similarity scoring
+            """)
+            if self.vector_store is not None:
+                st.success(f"✅ Vector store loaded with {self.vector_store.index.ntotal} vectors")
+            else:
+                st.error("❌ Vector store not loaded")
+            if self.processed_pdfs:
+                st.subheader("Processed PDFs")
+                for pdf in sorted(self.processed_pdfs):
+                    st.text(f"📄 {pdf}")
 
     def train_custom_embedding_model(
         self, 
@@ -764,7 +1061,7 @@ Context information is below:
         hub_token: Optional[str] = None,
         hub_private: bool = False
     ) -> bool:
-        """Train a custom embedding model using the PDF corpus with SentenceTransformers v3+ API.
+        """Train a custom embedding model using the PDF corpus with SentenceTransformers v3+ API and LangChain loaders.
         
         Args:
             base_model: Base model to fine-tune
@@ -795,7 +1092,7 @@ Context information is below:
             pdf_dir = str(self.rag_dir)
             output_dir = str(self.embeddings_dir / "custom_model")
             
-            logger.info("Training custom embedding model with SentenceTransformers v3+ API...")
+            logger.info("Training custom embedding model with SentenceTransformers v3+ API and LangChain loaders...")
             logger.info(f"PDF directory: {pdf_dir}")
             logger.info(f"Output directory: {output_dir}")
             logger.info(f"Base model: {base_model}")
@@ -812,8 +1109,8 @@ Context information is below:
             logger.info(f"Loading base model: {base_model}")
             model = SentenceTransformer(base_model, device=device)
             
-            # 2. Prepare training corpus from PDFs
-            logger.info("Preparing training corpus from PDFs...")
+            # 2. Prepare training corpus from PDFs using LangChain workflow
+            logger.info("Preparing training corpus from PDFs with LangChain loaders...")
             texts = self._prepare_training_corpus_from_pdfs()
             
             if not texts:
@@ -910,9 +1207,6 @@ Context information is below:
             # For the new API, we need to use a loss that works with the dataset format
             # Let's use MultipleNegativesRankingLoss which works well for this type of training
             loss = MultipleNegativesRankingLoss(model=model)
-            
-            # Alternative: if you specifically need TSDAE, you might need to use the old fit method
-            # For now, let's use MultipleNegativesRankingLoss which is more compatible with v3+ API
             
             # 5. Configure training arguments
             epochs = 5
@@ -1030,9 +1324,9 @@ Context information is below:
                 "early_stopping_patience": 5,
                 "eval_steps": training_args.eval_steps,
                 "device": device,
-                "training_api": "SentenceTransformers_v3+",
+                "training_api": "SentenceTransformers_v3+_with_LangChain",
                 "loss_function": "MultipleNegativesRankingLoss",
-                "eval_strategy": "steps",  # Updated parameter name
+                "eval_strategy": "steps",
                 "fp16": torch.cuda.is_available(),
                 "save_strategy": "steps",
                 "save_steps": training_args.save_steps,
@@ -1049,7 +1343,7 @@ Context information is below:
                 json.dump(metadata, f, indent=2)
             
             logger.info(f"Training metadata saved to: {metadata_path}")
-            logger.info("Custom embedding model trained successfully!")
+            logger.info("Custom embedding model trained successfully with LangChain workflow!")
             
             if push_to_hub and hub_model_id:
                 logger.info(f"🤗 Model uploaded to Hugging Face Hub: https://huggingface.co/{hub_model_id}")
@@ -1068,143 +1362,4 @@ Context information is below:
             logger.error(f"Error training custom embedding model: {e}")
             import traceback
             traceback.print_exc()
-            return False
-
-    def _prepare_training_corpus_from_pdfs(self) -> List[str]:
-        """Prepare training corpus from PDF files using modular extraction and chunking."""
-        pdf_paths = list(self.rag_dir.glob("*.pdf"))
-        if not pdf_paths:
-            logger.error(f"No PDF files found in {self.rag_dir}")
-            return []
-
-        logger.info(f"Found {len(pdf_paths)} PDF files to process for training")
-
-        # Step 1: Extract text from all PDFs (parallel, no metadata for training)
-        all_page_texts = extract_text_from_multiple_pdfs(pdf_paths, include_metadata=False, max_workers=None)
-
-        if not all_page_texts:
-            logger.warning("No text extracted from PDFs for training")
-            return []
-
-        logger.info(f"Extracted {len(all_page_texts)} pages for training")
-
-        # Step 2: Chunk all text using the modular chunking function
-        training_chunks = self._chunk_text_data(
-            all_page_texts, self.text_splitter_for_training, is_training=True
-        )
-
-        logger.info(f"Prepared {len(training_chunks)} training chunks")
-        return training_chunks
-
-    def streamlit_chat(self):
-        """Set up an interactive chat interface using Streamlit."""
-        # Import Streamlit dependencies only when needed
-        import streamlit as st
-        from streamlit_chat import message
-        import asyncio
-        import nest_asyncio
-
-        # Apply nest_asyncio to allow nested event loops
-        nest_asyncio.apply()
-
-        # Initialize session state for chat history and sources
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-        if "sources" not in st.session_state:
-            st.session_state.sources = {}
-        if "initialized" not in st.session_state:
-            st.session_state.initialized = False
-
-        # Set up the page
-        st.set_page_config(
-            page_title="PDF RAG Chat",
-            page_icon="📚",
-            layout="wide"
-        )
-
-        st.title("📚 PDF RAG Chat")
-        st.markdown("""
-        <style>
-        .stChatMessage { margin-bottom: 1.5em; }
-        .stButton>button { margin-top: 0.5em; }
-        .st-collapsed, .st-collapsible { background: #222 !important; color: #fff !important; }
-        </style>
-        """, unsafe_allow_html=True)
-        st.markdown("""
-        This chat interface allows you to ask questions about the content of your PDF documents.<br>
-        The system will retrieve relevant information and generate answers based on the context.
-        """, unsafe_allow_html=True)
-
-        # Initialize the system only once
-        if not st.session_state.initialized:
-            with st.spinner("Initializing system..."):
-                if self.vector_store is None:
-                    self._load_vector_store()
-                test_query = "test"
-                try:
-                    self.retrieve_documents(test_query, k=1)
-                    st.session_state.initialized = True
-                    st.success("System initialized successfully!")
-                except Exception as e:
-                    st.error(f"Error initializing system: {str(e)}")
-                    return
-
-        # Display chat history
-        for i, message_obj in enumerate(st.session_state.messages):
-            role = message_obj["role"]
-            content = message_obj["content"]
-            sources = message_obj.get("sources", None)
-            with st.chat_message(role):
-                st.markdown(content)
-                # Only for assistant, show sources if present
-                if role == "assistant" and sources:
-                    with st.expander("Show Sources", expanded=False):
-                        for src in sources:
-                            st.markdown(src)
-
-        # Chat input
-        prompt = st.chat_input("Ask a question about your PDFs")
-        if prompt:
-            # Add user message to chat history
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
-
-            # Generate response
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    try:
-                        result = self.generate_answer(prompt, score_threshold=0.5)
-                        response = result["answer"]
-                        sources = []
-                        for source, score in zip(result["sources"], result["retrieval_scores"]):
-                            sources.append(f"- {source} (Score: {score:.3f})")
-                        # Add assistant response to chat history, with sources
-                        st.session_state.messages.append({"role": "assistant", "content": response, "sources": sources})
-                        st.markdown(response)
-                        if sources:
-                            with st.expander("Show Sources", expanded=False):
-                                for src in sources:
-                                    st.markdown(src)
-                    except Exception as e:
-                        response = f"An error occurred: {str(e)}"
-                        st.session_state.messages.append({"role": "assistant", "content": response})
-                        st.error(response)
-
-        # Add a sidebar with information
-        with st.sidebar:
-            st.title("About")
-            st.markdown("""
-            This chat interface uses:
-            - PDF RAG system for document retrieval
-            - Advanced language model for answer generation
-            - Semantic search with similarity scoring
-            """)
-            if self.vector_store is not None:
-                st.success(f"✅ Vector store loaded with {self.vector_store.index.ntotal} vectors")
-            else:
-                st.error("❌ Vector store not loaded")
-            if self.processed_pdfs:
-                st.subheader("Processed PDFs")
-                for pdf in sorted(self.processed_pdfs):
-                    st.text(f"📄 {pdf}") 
+            return False 

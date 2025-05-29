@@ -57,7 +57,7 @@ _ASSISTANT_BODY_TMPL = Template(
     """<think>
 {{ explanation }}
 </think>
-Answer: {{ answer_text }}""",
+{{ answer_text }}""",
     trim_blocks=True,
     lstrip_blocks=True,
 )
