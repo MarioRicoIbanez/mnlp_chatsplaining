@@ -368,15 +368,13 @@ Context information:
         
         with open(output_file, mode, encoding="utf-8") as f:
             for chunk in chunks:
-                # Convert Document to dict format
+                # Convert Document to dict format with source at top level
                 chunk_dict = {
                     "text": chunk.page_content,
-                    "metadata": {
-                        "source": pdf_name,
-                        "page": chunk.metadata.get("page", "Unknown"),
-                        "book": chunk.metadata.get("book", "Unknown"),
-                        "chunk_index": chunk.metadata.get("chunk_index", 0)
-                    }
+                    "source": pdf_name,  # Moved to top level for lighteval compatibility
+                    "page": chunk.metadata.get("page", "Unknown"),
+                    "book": chunk.metadata.get("book", "Unknown"),
+                    "chunk_index": chunk.metadata.get("chunk_index", 0)
                 }
                 f.write(json.dumps(chunk_dict, ensure_ascii=False) + "\n")
         
@@ -426,17 +424,15 @@ Context information:
             logger.error("No chunks generated from PDFs")
             return ""
         
-        # Save all chunks to JSONL
+        # Save all chunks to JSONL with source at top level
         with open(output_filepath, "w", encoding="utf-8") as f:
             for chunk in all_chunks:
                 chunk_dict = {
                     "text": chunk.page_content,
-                    "metadata": {
-                        "source": chunk.metadata.get("source", "Unknown"),
-                        "page": chunk.metadata.get("page", "Unknown"),
-                        "book": chunk.metadata.get("book", "Unknown"),
-                        "chunk_index": chunk.metadata.get("chunk_index", 0)
-                    }
+                    "source": chunk.metadata.get("source", "Unknown"),  # Moved to top level for lighteval compatibility
+                    "page": chunk.metadata.get("page", "Unknown"),
+                    "book": chunk.metadata.get("book", "Unknown"),
+                    "chunk_index": chunk.metadata.get("chunk_index", 0)
                 }
                 f.write(json.dumps(chunk_dict, ensure_ascii=False) + "\n")
         
