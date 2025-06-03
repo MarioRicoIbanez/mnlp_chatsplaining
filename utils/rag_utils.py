@@ -645,7 +645,8 @@ Context information:
                 search_kwargs={
                     'k': k,
                     'score_threshold': score_threshold or self.similarity_threshold,
-                    'filter': filter_metadata
+                    'filter': filter_metadata,
+                    'num_chunks': k  # Add num_chunks parameter
                 }
             )
             
@@ -1300,8 +1301,13 @@ Context information:
             logger.info("Saving trained model...")
             trainer.save_model()
             
+            # Add num_chunks parameter to model config using the same value as training
+            model_config = model.get_config_dict()
+            model_config["num_chunks"] = len(train_dataset)  # Use the same number of chunks as training
+            model.save_config_dict(model_config)
+            
             logger.info(f"Custom embedding model training completed!")
-            logger.info(f"Model saved to: {output_dir_path}")
+            logger.info(f"Model saved with num_chunks={len(train_dataset)} (matching training data)")
             
             # 8. Save additional metadata
             metadata = {
