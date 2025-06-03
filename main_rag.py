@@ -14,6 +14,7 @@ from typing import List, Dict, Optional, Any
 from dotenv import load_dotenv
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import logging
 
 import PyPDF2
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -25,6 +26,75 @@ from langchain_community.llms import HuggingFacePipeline
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 import torch
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# Get the directory where this script is located
+SCRIPT_DIR = Path(__file__).parent.absolute()
+PROJECT_ROOT = SCRIPT_DIR  # Assuming the script is in the project root
+
+# Set up project directories relative to script location
+RESULTS_DIR = PROJECT_ROOT / "results_model"
+RAG_DIR = PROJECT_ROOT / "RAG"
+EMBEDDINGS_DIR = RESULTS_DIR / "embeddings"
+
+# Create necessary directories
+RESULTS_DIR.mkdir(exist_ok=True)
+RAG_DIR.mkdir(exist_ok=True)
+EMBEDDINGS_DIR.mkdir(exist_ok=True)
+
+print(f"Script location: {SCRIPT_DIR}")
+print(f"Project root: {PROJECT_ROOT}")
+print(f"RAG directory: {RAG_DIR}")
+print(f"Embeddings directory: {EMBEDDINGS_DIR}")
+
+# Load environment variables from .env file (look in script directory first)
+env_file = PROJECT_ROOT / ".env"
+if env_file.exists():
+    load_dotenv(env_file)
+    print(f"Loaded .env from: {env_file}")
+else:
+    load_dotenv()  # Try default locations
+    print("Loaded .env from default locations")
+
+ 
+def find_rag_directory() -> Path:
+    """Find the RAG directory containing PDF files."""
+    
+    # Possible locations to search for RAG directory
+    search_locations = [
+        # Current directory structure
+        RAG_DIR,
+        # Results model directory
+        RESULTS_DIR / "RAG", 
+        # Parent directories
+        PROJECT_ROOT.parent / "RAG",
+        PROJECT_ROOT.parent / "results_model" / "RAG",
+    ]
+    
+    # Also search recursively from project root
+    for subdir in PROJECT_ROOT.rglob("RAG"):
+        if subdir.is_dir():
+            search_locations.append(subdir)
+    
+    # Check each location
+    for location in search_locations:
+        if location.exists() and location.is_dir():
+            pdf_files = list(location.glob("*.pdf"))
+            if len(pdf_files) > 0:
+                logger.info(f"Found RAG directory with {len(pdf_files)} PDFs at: {location}")
+                return location
+    
+    # Default: use the project RAG directory (create if needed)
+    logger.warning(f"No existing RAG directory with PDFs found, using default: {RAG_DIR}")
+    RAG_DIR.mkdir(exist_ok=True)
+    return RAG_DIR
 
 
 def extract_and_chunk_pdf(args):
@@ -83,10 +153,12 @@ class PDFRAG:
         self,
         model_name: str = "Qwen/Qwen3-0.6B",
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-        max_chunk_size: int = 512,
-        chunk_overlap: int = 50,
+        max_chunk_size: int = 1024,
+        chunk_overlap: int = 100,
         similarity_threshold: float = 0.7,
-        embeddings_dir: str = "RAG/embeddings",
+        embeddings_dir: Optional[str] = None,
+        use_custom_embedding: bool = False,
+        custom_embedding_path: Optional[str] = None,
     ):
         """Initialize PDF RAG system.
 
@@ -96,16 +168,34 @@ class PDFRAG:
             max_chunk_size: Maximum number of tokens per chunk
             chunk_overlap: Overlap between chunks
             similarity_threshold: Default threshold for document similarity (0-1)
-            embeddings_dir: Directory to save/load embeddings
+            embeddings_dir: Directory to save/load embeddings (defaults to project structure)
+            use_custom_embedding: Whether to use custom trained embedding model
+            custom_embedding_path: Path to custom trained embedding model (defaults to project structure)
         """
-        print(f"🤖 Loading model from HuggingFace: {model_name}")
+        logger.info(f"Loading model from HuggingFace: {model_name}")
+        logger.info("Project structure:")
+        logger.info(f"   Script: {SCRIPT_DIR}")
+        logger.info(f"   Project root: {PROJECT_ROOT}")
+        logger.info(f"   Results: {RESULTS_DIR}")
 
-        # Load environment variables
-        load_dotenv()
+        # Auto-detect RAG directory if not provided
+        detected_rag_dir = find_rag_directory()
+        
+        # Set up paths with auto-detection and project-relative defaults
+        if embeddings_dir is None:
+            embeddings_dir = str(EMBEDDINGS_DIR)
+        if custom_embedding_path is None:
+            custom_embedding_path = str(EMBEDDINGS_DIR / "custom_model")
+            
+        logger.info(f"Using embeddings directory: {embeddings_dir}")
+        logger.info(f"Using custom embedding path: {custom_embedding_path}")
 
         # Set up embeddings directory
         self.embeddings_dir = Path(embeddings_dir)
-        self.embeddings_dir.mkdir(exist_ok=True)
+        self.embeddings_dir.mkdir(parents=True, exist_ok=True)
+
+        # Store detected RAG directory for later use
+        self.rag_dir = detected_rag_dir
 
         # Initialize text splitter with token-based length function
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -115,19 +205,65 @@ class PDFRAG:
             separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
         )
 
-        # Initialize embeddings with GPU support and faster model
+        # Initialize embeddings with GPU support
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"🚀 Using device: {device} for embeddings")
+        logger.info(f"Using device: {device} for embeddings")
+        
+        # Store embedding configuration
+        self.use_custom_embedding = use_custom_embedding
+        self.custom_embedding_path = custom_embedding_path
 
-        # Use a smaller, faster model for embeddings
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2",  # Much faster than sentence-transformers version
-            model_kwargs={"device": device},
-            encode_kwargs={
-                "device": device,
-                "batch_size": 64,
-            },  # Large batch size for speed
-        )
+        # Choose embedding model
+        if use_custom_embedding and Path(custom_embedding_path).exists():
+            logger.info(f"Using custom trained embedding model: {custom_embedding_path}")
+            # For custom models, we'll use sentence-transformers directly
+            from sentence_transformers import SentenceTransformer
+            self.custom_model = SentenceTransformer(custom_embedding_path)
+            
+            # Create a wrapper to make it compatible with LangChain
+            class CustomEmbeddingWrapper:
+                def __init__(self, model):
+                    self.model = model
+                    self.max_seq_length = getattr(model, 'max_seq_length', 512)
+                    
+                def _truncate_text(self, text: str) -> str:
+                    """Truncate text to fit model's max sequence length."""
+                    tokens = self.model.tokenizer.encode(text, add_special_tokens=False)
+                    if len(tokens) > self.max_seq_length - 2:  # Account for special tokens
+                        tokens = tokens[:self.max_seq_length - 2]
+                        text = self.model.tokenizer.decode(tokens, skip_special_tokens=True)
+                    return text
+                    
+                def embed_documents(self, texts):
+                    # Truncate texts that are too long
+                    truncated_texts = [self._truncate_text(text) for text in texts]
+                    return self.model.encode(truncated_texts).tolist()
+                    
+                def embed_query(self, text):
+                    truncated_text = self._truncate_text(text)
+                    return self.model.encode([truncated_text])[0].tolist()
+            
+            self.embeddings = CustomEmbeddingWrapper(self.custom_model)
+            logger.info("Custom embedding model loaded successfully")
+        else:
+            if use_custom_embedding:
+                logger.warning(f"Custom embedding model not found at {custom_embedding_path}, using default")
+            
+            # Use default HuggingFace embeddings with longer sequence support
+            if embedding_model == "sentence-transformers/all-MiniLM-L6-v2":
+                # Switch to a model that supports longer sequences
+                logger.warning("Switching to all-mpnet-base-v2 for better 1024-token support")
+                embedding_model = "sentence-transformers/all-mpnet-base-v2"
+            
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=embedding_model,
+                model_kwargs={"device": device},
+                encode_kwargs={
+                    "device": device,
+                    "batch_size": 32,  # Smaller batch for longer sequences
+                    "truncate_dim": None,  # Don't truncate
+                },
+            )
 
         # Initialize vector store
         self.vector_store = None
@@ -143,12 +279,10 @@ class PDFRAG:
         self.similarity_threshold = similarity_threshold
 
         # Initialize tokenizer for length counting
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
         # Initialize LLM
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=True, padding_side="right"
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True, padding_side="right")
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -164,7 +298,7 @@ class PDFRAG:
             tokenizer=self.tokenizer,
             max_new_tokens=1000,
             do_sample=True,
-            temperature=0.7,
+            temperature=0.8,
             pad_token_id=self.tokenizer.eos_token_id,
         )
 
@@ -185,11 +319,22 @@ Context information is below:
         self.assistant_start = "<|im_start|>assistant\n"
         self.assistant_end = "\n<|im_end|>"
 
-        print("✅ Model and components loaded")
+        logger.info("Model and components loaded")
+        logger.info(f"RAG system ready with directory: {self.rag_dir}")
 
     def _count_tokens(self, text: str) -> int:
         """Count the number of tokens in a text."""
         return len(self.tokenizer.encode(text))
+    
+    def _truncate_to_embedding_limit(self, text: str, max_tokens: int = 512) -> str:
+        """Truncate text to fit embedding model limits."""
+        tokens = self.tokenizer.encode(text)
+        if len(tokens) <= max_tokens:
+            return text
+        
+        # Truncate to max_tokens and decode back
+        truncated_tokens = tokens[:max_tokens]
+        return self.tokenizer.decode(truncated_tokens, skip_special_tokens=True)
 
     def _extract_text_from_pdf(self, pdf_path: str) -> List[Dict[str, Any]]:
         """Extract text from PDF with metadata.
@@ -200,7 +345,7 @@ Context information is below:
         Returns:
             List of dictionaries containing text chunks and metadata
         """
-        print(f"📖 Processing PDF: {pdf_path}")
+        logger.info(f"Processing PDF: {pdf_path}")
 
         # Get book title from filename
         book_title = Path(pdf_path).stem
@@ -233,11 +378,11 @@ Context information is below:
     def _load_vector_store(self):
         """Load existing vector store if available."""
         index_path = self.embeddings_dir / "faiss_index"
-        print(f"🔍 Checking for vector store at: {index_path}")
+        logger.info(f"Checking for vector store at: {index_path}")
 
         if index_path.exists():
             try:
-                print("📚 Loading existing vector store...")
+                logger.info("Loading existing vector store...")
                 self.vector_store = FAISS.load_local(
                     str(index_path),
                     self.embeddings,
@@ -249,35 +394,35 @@ Context information is below:
                     hasattr(self.vector_store, "index")
                     and self.vector_store.index.ntotal > 0
                 ):
-                    print(
-                        f"✅ Vector store loaded successfully with {self.vector_store.index.ntotal} vectors"
+                    logger.info(
+                        f"Vector store loaded successfully with {self.vector_store.index.ntotal} vectors"
                     )
                 else:
-                    print("⚠️ Vector store loaded but appears to be empty")
+                    logger.warning("Vector store loaded but appears to be empty")
                     self.vector_store = None
 
             except Exception as e:
-                print(f"⚠️ Could not load vector store: {e}")
-                print(f"⚠️ Error type: {type(e).__name__}")
+                logger.warning(f"Could not load vector store: {e}")
+                logger.warning(f"Error type: {type(e).__name__}")
                 import traceback
 
                 traceback.print_exc()
                 self.vector_store = None
         else:
-            print("📁 No existing vector store found")
+            logger.info("INFO: No existing vector store found")
 
     def _save_vector_store(self):
         """Save vector store to disk."""
         if self.vector_store is not None:
             try:
                 index_path = self.embeddings_dir / "faiss_index"
-                print("💾 Saving vector store...")
+                logger.info("Saving vector store...")
                 self.vector_store.save_local(str(index_path))
-                print(
-                    f"✅ Vector store saved successfully with {self.vector_store.index.ntotal} vectors"
+                logger.info(
+                    f"Vector store saved successfully with {self.vector_store.index.ntotal} vectors"
                 )
             except Exception as e:
-                print(f"⚠️ Could not save vector store: {e}")
+                logger.warning(f"Could not save vector store: {e}")
 
     def _load_processed_pdfs(self):
         """Load list of processed PDFs."""
@@ -285,7 +430,7 @@ Context information is below:
         if processed_file.exists():
             with open(processed_file, "r") as f:
                 self.processed_pdfs = set(line.strip() for line in f)
-            print(f"📚 Loaded {len(self.processed_pdfs)} processed PDFs")
+            logger.info(f"Loaded {len(self.processed_pdfs)} processed PDFs")
 
     def _save_processed_pdfs(self):
         """Save list of processed PDFs."""
@@ -293,7 +438,7 @@ Context information is below:
         with open(processed_file, "w") as f:
             for pdf in sorted(self.processed_pdfs):
                 f.write(f"{pdf}\n")
-        print(f"💾 Saved {len(self.processed_pdfs)} processed PDFs")
+        logger.info(f"Saved {len(self.processed_pdfs)} processed PDFs")
 
     def add_pdf(self, pdf_path: str):
         """Add a PDF book to the vector store.
@@ -304,10 +449,10 @@ Context information is below:
         # Check if PDF was already processed
         pdf_name = Path(pdf_path).name
         if pdf_name in self.processed_pdfs:
-            print(f"📚 Skipping already processed PDF: {pdf_name}")
+            logger.info(f"Skipping already processed PDF: {pdf_name}")
             return
 
-        print(f"📖 Processing PDF: {pdf_path}")
+        logger.info(f"Processing PDF: {pdf_path}")
 
         # Extract text from PDF
         documents = self._extract_text_from_pdf(pdf_path)
@@ -318,16 +463,18 @@ Context information is below:
             # Split text into chunks
             text_chunks = self.text_splitter.split_text(doc["text"])
 
-            # Create chunks with metadata
+            # Create chunks with metadata, ensuring they fit embedding limits
             for chunk in text_chunks:
                 if chunk.strip():  # Only add non-empty chunks
-                    chunks.append({"text": chunk, "metadata": doc["metadata"]})
+                    # Truncate chunk to fit embedding model limits
+                    truncated_chunk = self._truncate_to_embedding_limit(chunk.strip(), max_tokens=512)
+                    chunks.append({"text": truncated_chunk, "metadata": doc["metadata"]})
 
         if not chunks:
-            print(f"⚠️ No valid chunks found in {pdf_name}")
+            logger.warning(f"No valid chunks found in {pdf_name}")
             return
 
-        print(f"🔄 Processing {len(chunks)} chunks with GPU acceleration...")
+        logger.info(f"Processing {len(chunks)} chunks with GPU acceleration...")
 
         try:
             # Extract texts and metadatas for batch processing
@@ -336,16 +483,16 @@ Context information is below:
 
             # Create or update vector store with batch processing
             if self.vector_store is None:
-                print("🆕 Creating new vector store...")
+                logger.info("Creating new vector store...")
                 self.vector_store = FAISS.from_texts(
                     texts, self.embeddings, metadatas=metadatas
                 )
             else:
-                print("➕ Adding to existing vector store...")
+                logger.info("Adding to existing vector store...")
                 self.vector_store.add_texts(texts, metadatas=metadatas)
 
-            print(
-                f"✅ Added {len(documents)} pages ({len(chunks)} chunks) from {Path(pdf_path).stem}"
+            logger.info(
+                f"Added {len(documents)} pages ({len(chunks)} chunks) from {Path(pdf_path).stem}"
             )
 
             # Mark PDF as processed and save
@@ -356,7 +503,7 @@ Context information is below:
             self._save_vector_store()
 
         except Exception as e:
-            print(f"❌ Error processing {pdf_name}: {str(e)}")
+            logger.error(f"Error processing {pdf_name}: {str(e)}")
             raise
 
     def retrieve_documents(
@@ -377,12 +524,12 @@ Context information is below:
         Returns:
             List of dictionaries containing document content, score, and metadata
         """
-        print(
-            f"🔍 Retrieving documents for query: '{query[:50]}...' (vector_store exists: {self.vector_store is not None})"
+        logger.info(
+            f"Retrieving documents for query: '{query[:50]}...' (vector_store exists: {self.vector_store is not None})"
         )
 
         if self.vector_store is None:
-            print("❌ No vector store available for retrieval")
+            logger.error("ERROR: No vector store available for retrieval")
             return []
 
         try:
@@ -391,7 +538,7 @@ Context information is below:
                 query, k=k, filter=filter_metadata
             )
 
-            print(f"📚 Found {len(docs_and_scores)} documents before filtering")
+            logger.info(f"Found {len(docs_and_scores)} documents before filtering")
 
             # Filter by score threshold if specified
             if score_threshold is not None:
@@ -400,8 +547,8 @@ Context information is below:
                     for doc, score in docs_and_scores
                     if score >= score_threshold
                 ]
-                print(
-                    f"📚 {len(docs_and_scores)} documents after score filtering (threshold: {score_threshold})"
+                logger.info(
+                    f"INFO: {len(docs_and_scores)} documents after score filtering (threshold: {score_threshold})"
                 )
 
             # Format results
@@ -419,7 +566,7 @@ Context information is below:
             return results
 
         except Exception as e:
-            print(f"❌ Error during document retrieval: {e}")
+            logger.error(f"ERROR: Error during document retrieval: {e}")
             import traceback
 
             traceback.print_exc()
@@ -503,17 +650,17 @@ Context information is below:
     def debug_vector_store(self):
         """Debug function to analyze vector store contents."""
         if self.vector_store is None:
-            print("❌ No vector store to debug")
+            logger.error("ERROR: No vector store to debug")
             return
 
-        print(f"\n🔍 Vector Store Debug Information:")
-        print(f"Total vectors: {self.vector_store.index.ntotal}")
+        logger.info("INFO: Vector Store Debug Information:")
+        logger.info(f"Total vectors: {self.vector_store.index.ntotal}")
 
         # Get a sample of documents to see what's in the store
         try:
             # Get all document metadata
             docstore = self.vector_store.docstore
-            print(f"Docstore size: {len(docstore._dict)}")
+            logger.info(f"INFO: Docstore size: {len(docstore._dict)}")
 
             # Count documents by book
             book_counts = {}
@@ -521,12 +668,12 @@ Context information is below:
                 book_name = doc.metadata.get("book", "Unknown")
                 book_counts[book_name] = book_counts.get(book_name, 0) + 1
 
-            print(f"\n📚 Documents by book:")
+            logger.info("INFO: Documents by book:")
             for book, count in sorted(book_counts.items()):
-                print(f"  {book}: {count} chunks")
+                logger.info(f"  {book}: {count} chunks")
 
             # Test embedding quality with a simple query
-            print(f"\n🧪 Testing embedding quality:")
+            logger.info("INFO: Testing embedding quality:")
             test_queries = [
                 "machine learning",
                 "neural networks",
@@ -536,23 +683,23 @@ Context information is below:
 
             for query in test_queries:
                 docs = self.vector_store.similarity_search_with_score(query, k=3)
-                print(f"\nQuery: '{query}'")
+                logger.info(f"\nQuery: '{query}'")
                 for i, (doc, score) in enumerate(docs):
                     book = doc.metadata.get("book", "Unknown")
                     page = doc.metadata.get("page", "Unknown")
                     content_preview = doc.page_content[:100].replace("\n", " ")
-                    print(f"  {i+1}. {book} (Page {page}) - Score: {score:.3f}")
-                    print(f"     Content: {content_preview}...")
+                    logger.info(f"  {i+1}. {book} (Page {page}) - Score: {score:.3f}")
+                    logger.info(f"     Content: {content_preview}...")
 
         except Exception as e:
-            print(f"❌ Error during debug: {e}")
+            logger.error("ERROR: Error during debug: {e}")
             import traceback
 
             traceback.print_exc()
 
     def rebuild_vector_store(self):
         """Rebuild the vector store from scratch."""
-        print("🔄 Rebuilding vector store from scratch...")
+        logger.info("INFO: Rebuilding vector store from scratch...")
 
         # Clear existing data
         self.vector_store = None
@@ -566,9 +713,9 @@ Context information is below:
                 shutil.rmtree(self.embeddings_dir / "faiss_index")
             if (self.embeddings_dir / "processed_pdfs.txt").exists():
                 os.remove(self.embeddings_dir / "processed_pdfs.txt")
-            print("✅ Cleared existing vector store")
+            logger.info("INFO: Cleared existing vector store")
         except Exception as e:
-            print(f"⚠️ Error clearing existing data: {e}")
+            logger.warning(f"WARNING: Error clearing existing data: {e}")
 
     def add_multiple_pdfs(self, pdf_paths: List[str], max_workers: int = 2):
         """Add multiple PDFs efficiently.
@@ -577,7 +724,7 @@ Context information is below:
             pdf_paths: List of PDF file paths
             max_workers: Number of parallel workers for PDF text extraction
         """
-        print(f"🚀 Processing {len(pdf_paths)} PDFs with {max_workers} workers...")
+        logger.info(f"INFO: Processing {len(pdf_paths)} PDFs with {max_workers} workers...")
 
         # Filter out already processed PDFs
         unprocessed_pdfs = []
@@ -586,20 +733,20 @@ Context information is below:
             if pdf_name not in self.processed_pdfs:
                 unprocessed_pdfs.append(pdf_path)
             else:
-                print(f"📚 Skipping already processed: {pdf_name}")
+                logger.info(f"INFO: Skipping already processed: {pdf_name}")
 
         if not unprocessed_pdfs:
-            print("✅ All PDFs already processed!")
+            logger.info("INFO: All PDFs already processed!")
             return
 
-        print(f"📖 Processing {len(unprocessed_pdfs)} new PDFs...")
+        logger.info(f"INFO: Processing {len(unprocessed_pdfs)} new PDFs...")
 
         # Process each PDF (keep sequential for now to avoid memory issues)
         for pdf_path in unprocessed_pdfs:
             try:
                 self.add_pdf(pdf_path)
             except Exception as e:
-                print(f"❌ Failed to process {Path(pdf_path).name}: {str(e)}")
+                logger.error(f"ERROR: Failed to process {Path(pdf_path).name}: {str(e)}")
                 continue
 
     def add_multiple_pdfs_parallel(self, pdf_paths: List[str], max_workers: int = None):
@@ -612,8 +759,8 @@ Context information is below:
         if max_workers is None:
             max_workers = min(mp.cpu_count(), len(pdf_paths))
 
-        print(
-            f"🚀 Processing {len(pdf_paths)} PDFs with {max_workers} parallel workers..."
+        logger.info(
+            f"INFO: Processing {len(pdf_paths)} PDFs with {max_workers} parallel workers..."
         )
 
         # Filter out already processed PDFs
@@ -623,16 +770,16 @@ Context information is below:
             if pdf_name not in self.processed_pdfs:
                 unprocessed_pdfs.append(pdf_path)
             else:
-                print(f"📚 Skipping already processed: {pdf_name}")
+                logger.info(f"INFO: Skipping already processed: {pdf_name}")
 
         if not unprocessed_pdfs:
-            print("✅ All PDFs already processed!")
+            logger.info("INFO: All PDFs already processed!")
             return
 
-        print(f"📖 Processing {len(unprocessed_pdfs)} new PDFs in parallel...")
+        logger.info(f"INFO: Processing {len(unprocessed_pdfs)} new PDFs in parallel...")
 
         # Prepare arguments for multiprocessing
-        args = [(pdf_path, 512, 50) for pdf_path in unprocessed_pdfs]
+        args = [(pdf_path, 1024, 100) for pdf_path in unprocessed_pdfs]
 
         # Process PDFs in parallel
         all_chunks = []
@@ -654,10 +801,10 @@ Context information is below:
                     pdf_path_result, num_pages, chunks = future.result()
 
                     if isinstance(chunks, str):  # Error case
-                        print(f"❌ {pdf_name}: {chunks}")
+                        logger.error(f"ERROR: {pdf_name}: {chunks}")
                         continue
 
-                    print(f"✅ {pdf_name}: {num_pages} pages, {len(chunks)} chunks")
+                    logger.info(f"INFO: {pdf_name}: {num_pages} pages, {len(chunks)} chunks")
 
                     # Collect chunks and metadata
                     for chunk in chunks:
@@ -667,25 +814,25 @@ Context information is below:
                     processed_files.append(pdf_name)
 
                 except Exception as e:
-                    print(f"❌ {pdf_name}: {str(e)}")
+                    logger.error(f"ERROR: {pdf_name}: {str(e)}")
 
         if not all_chunks:
-            print("⚠️ No valid chunks to add!")
+            logger.warning("WARNING: No valid chunks to add!")
             return
 
         # Add all chunks to vector store in one go (much faster)
-        print(
-            f"🔄 Adding {len(all_chunks)} chunks to vector store with GPU acceleration..."
+        logger.info(
+            f"INFO: Adding {len(all_chunks)} chunks to vector store with GPU acceleration..."
         )
 
         try:
             if self.vector_store is None:
-                print("🆕 Creating new vector store...")
+                logger.info("INFO: Creating new vector store...")
                 self.vector_store = FAISS.from_texts(
                     all_chunks, self.embeddings, metadatas=all_metadatas
                 )
             else:
-                print("➕ Adding to existing vector store...")
+                logger.info("INFO: Adding to existing vector store...")
                 self.vector_store.add_texts(all_chunks, metadatas=all_metadatas)
 
             # Mark all PDFs as processed
@@ -695,13 +842,51 @@ Context information is below:
             self._save_processed_pdfs()
             self._save_vector_store()
 
-            print(
-                f"✅ Successfully processed {len(processed_files)} PDFs with {len(all_chunks)} total chunks"
+            logger.info(
+                f"INFO: Successfully processed {len(processed_files)} PDFs with {len(all_chunks)} total chunks"
             )
 
         except Exception as e:
-            print(f"❌ Error adding chunks to vector store: {e}")
+            logger.error(f"ERROR: Error adding chunks to vector store: {e}")
             raise
+    
+    def train_custom_embedding_model(self, base_model: str = "sentence-transformers/all-mpnet-base-v2") -> bool:
+        """Train a custom embedding model using the PDF corpus."""
+        try:
+            from utils.embedding_utils import train_custom_embedding_model
+            
+            # Use project-relative paths
+            pdf_dir = str(self.rag_dir)
+            output_dir = str(self.embeddings_dir / "custom_model")
+            
+            logger.info("INFO: Training custom embedding model...")
+            logger.info(f"INFO: PDF directory: {pdf_dir}")
+            logger.info(f"INFO: Output directory: {output_dir}")
+            logger.info(f"INFO: Base model: {base_model}")
+            
+            success = train_custom_embedding_model(
+                pdf_dir=pdf_dir,
+                output_dir=output_dir,
+                base_model=base_model
+            )
+            
+            if success:
+                logger.info("INFO: Custom embedding model trained successfully!")
+                logger.info("INFO: To use it, initialize PDFRAG with:")
+                logger.info(f"   use_custom_embedding=True")
+                logger.info(f"   custom_embedding_path='{output_dir}'")
+                return True
+            else:
+                logger.error("ERROR: Custom embedding model training failed!")
+                return False
+                
+        except ImportError as e:
+            logger.error(f"ERROR: Could not import embedding utilities: {e}")
+            logger.info("INFO: Install required packages: pip install sentence-transformers scikit-learn")
+            return False
+        except Exception as e:
+            logger.error(f"ERROR: Error training custom embedding model: {e}")
+            return False
 
 
 def main():
@@ -709,31 +894,44 @@ def main():
     import sys
     import time
 
-    # Check if user wants to rebuild
+    logger.info("PDF RAG System Starting...")
+    logger.info("Project structure:")
+    logger.info(f"   Script: {SCRIPT_DIR}")
+    logger.info(f"   Project root: {PROJECT_ROOT}")
+    logger.info(f"   RAG directory: {RAG_DIR}")
+    logger.info(f"   Results: {RESULTS_DIR}")
+    logger.info(f"   Embeddings: {EMBEDDINGS_DIR}")
+
+    # Check command line arguments
     rebuild = "--rebuild" in sys.argv
+    train_embedding = "--train-embedding" in sys.argv
 
     # Initialize RAG system with optimized settings
-    rag = PDFRAG(max_chunk_size=512, similarity_threshold=0.1)
+    rag = PDFRAG(max_chunk_size=1024, similarity_threshold=0.1)
 
     if rebuild:
-        print("🚀 Fast Embedding Rebuild Mode")
-        print("=" * 50)
+        logger.info("Fast Embedding Rebuild Mode")
+        logger.info("=" * 50)
 
         # Force rebuild
-        print("🔄 Clearing existing embeddings...")
+        logger.info("Clearing existing embeddings...")
         rag.rebuild_vector_store()
 
-        # Get all PDFs
-        pdf_dir = Path("RAG")
-        pdf_files = list(pdf_dir.glob("*.pdf"))
+        # Get all PDFs using the stored RAG directory
+        pdf_files = list(rag.rag_dir.glob("*.pdf"))
 
-        print(f"\n📚 Found {len(pdf_files)} PDF files")
+        logger.info(f"Found {len(pdf_files)} PDF files in {rag.rag_dir}")
         for i, pdf_file in enumerate(pdf_files, 1):
             size_mb = pdf_file.stat().st_size / (1024 * 1024)
-            print(f"  {i}. {pdf_file.name} ({size_mb:.1f} MB)")
+            logger.info(f"  {i}. {pdf_file.name} ({size_mb:.1f} MB)")
+
+        if not pdf_files:
+            logger.warning(f"No PDF files found in {rag.rag_dir}")
+            logger.info("Add PDF files to the RAG directory and try again")
+            return
 
         # Process all PDFs in parallel
-        print(f"\n🚀 Starting parallel processing with GPU acceleration...")
+        logger.info("Starting parallel processing with GPU acceleration...")
         start_time = time.time()
 
         # Use parallel processing for much faster performance
@@ -743,41 +941,67 @@ def main():
         total_time = time.time() - start_time
         if rag.vector_store:
             total_vectors = rag.vector_store.index.ntotal
-            print(f"\n🎉 Rebuild complete!")
-            print(f"⏱️ Total time: {total_time:.1f} seconds")
-            print(f"📊 Total vectors: {total_vectors}")
-            print(f"🚀 Speed: {total_vectors/total_time:.1f} vectors/second")
+            logger.info("Rebuild complete!")
+            logger.info(f"Total time: {total_time:.1f} seconds")
+            logger.info(f"Total vectors: {total_vectors}")
+            logger.info(f"Speed: {total_vectors/total_time:.1f} vectors/second")
 
             # Quick test
-            print(f"\n🧪 Quick test retrieval:")
+            logger.info("Quick test retrieval:")
             test_results = rag.retrieve_documents("machine learning", k=3)
             for doc in test_results:
-                print(
-                    f"  ✓ {doc['book']} (Page {doc['page']}) - Score: {doc['score']:.3f}"
-                )
+                logger.info(f"  {doc['book']} (Page {doc['page']}) - Score: {doc['score']:.3f}")
         else:
-            print(f"\n❌ Rebuild failed after {total_time:.1f} seconds")
+            logger.error(f"Rebuild failed after {total_time:.1f} seconds")
 
         return  # Exit after rebuild
 
-    # Normal processing mode
-    # Add PDF books efficiently
-    pdf_dir = Path("RAG")
-    pdf_files = list(pdf_dir.glob("*.pdf"))
+    if train_embedding:
+        logger.info("Custom Embedding Training Mode")
+        logger.info("=" * 50)
+        
+        # Check if PDFs exist first
+        pdf_files = list(rag.rag_dir.glob("*.pdf"))
+        if not pdf_files:
+            logger.error(f"No PDF files found in {rag.rag_dir}")
+            logger.info("Add PDF files to the RAG directory first")
+            return
+        
+        logger.info(f"Found {len(pdf_files)} PDF files for training")
+        
+        # Train custom embedding model
+        success = rag.train_custom_embedding_model()
+        
+        if success:
+            logger.info("Embedding training completed!")
+            logger.info("Now run with --rebuild to use the custom model:")
+            logger.info("   python main_rag.py --rebuild")
+        else:
+            logger.error("Embedding training failed!")
+            
+        return  # Exit after training
 
-    print(f"\n📚 Found {len(pdf_files)} PDF files")
+    # Normal processing mode
+    # Add PDF books efficiently using the stored RAG directory
+    pdf_files = list(rag.rag_dir.glob("*.pdf"))
+
+    logger.info(f"Found {len(pdf_files)} PDF files in {rag.rag_dir}")
+
+    if not pdf_files:
+        logger.warning(f"No PDF files found in {rag.rag_dir}")
+        logger.info("Add PDF files to the RAG directory:")
+        logger.info(f"   cp your_pdfs/*.pdf {rag.rag_dir}/")
+        return
 
     # Use the optimized batch processing
     rag.add_multiple_pdfs([str(f) for f in pdf_files])
 
     # Debug: Check vector store status
     if rag.vector_store is not None:
-        print(
-            f"\n🎯 Vector store status: LOADED with {rag.vector_store.index.ntotal} vectors"
-        )
+        logger.info(f"Vector store status: LOADED with {rag.vector_store.index.ntotal} vectors")
         rag.debug_vector_store()  # Add debug analysis
     else:
-        print("\n❌ Vector store status: NOT LOADED")
+        logger.error("Vector store status: NOT LOADED")
         return
 
     # Example questions
@@ -786,36 +1010,37 @@ def main():
         "Explain the concept of backpropagation.",
         "What are the main types of neural networks?",
         "How does gradient descent work?",
+        "What is the atommic commit?",
+        "What is the spleen used for?",
+        "What is the baby step giant step algorithm?",
     ]
 
     for question in questions:
-        print(f"\n{'='*80}")
-        print(f"❓ Question: {question}")
-        print("-" * 80)
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Question: {question}")
+        logger.info("-" * 80)
 
         # Show retrieved documents with no score threshold for debugging
-        print("\n📚 Retrieved Documents (no threshold):")
+        logger.info("Retrieved Documents (no threshold):")
         retrieved = rag.retrieve_documents(question, k=5, score_threshold=None)
         for i, doc in enumerate(retrieved):
-            print(f"\n{i+1}. Book: {doc['book']}")
-            print(f"   Page: {doc['page']}")
-            print(f"   Score: {doc['score']:.3f}")
-            print(f"   Content: {doc['content'][:200]}...")
+            logger.info(f"\n{i+1}. Book: {doc['book']}")
+            logger.info(f"   Page: {doc['page']}")
+            logger.info(f"   Score: {doc['score']:.3f}")
+            logger.info(f"   Content: {doc['content'][:200]}...")
 
         if not retrieved:
-            print(
-                "⚠️ No documents retrieved! There might be an issue with the embeddings."
-            )
+            logger.warning("No documents retrieved! There might be an issue with the embeddings.")
             continue
 
         # Generate answer
         result = rag.generate_answer(question, score_threshold=None)
 
-        print(f"\n🎯 Answer:\n{result['answer']}")
-        print(f"\n📚 Sources:")
+        logger.info(f"Answer:\n{result['answer']}")
+        logger.info("Sources:")
         for source, score in zip(result["sources"], result["retrieval_scores"]):
-            print(f"- {source} (Score: {score:.3f})")
-        print(f"\n📄 Documents used: {result['context_docs']}")
+            logger.info(f"- {source} (Score: {score:.3f})")
+        logger.info(f"Documents used: {result['context_docs']}")
 
 
 if __name__ == "__main__":

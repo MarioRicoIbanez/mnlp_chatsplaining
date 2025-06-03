@@ -55,7 +55,6 @@ _ASSISTANT_START = "<|im_start|>assistant\n"
 
 _ASSISTANT_BODY_TMPL = Template(
     """<think>
-{{ explanation }}
 </think>
 {{ answer_text }}""",
     trim_blocks=True,
@@ -111,7 +110,7 @@ def process_mcq_dataset(
 
     # --- 3. Assistant body --------------------------------------------------
     assistant_body = _ASSISTANT_BODY_TMPL.render(
-        explanation=row["explanation"],
+        # explanation=row["explanation"],
         answer_text=row["answer_text"],
     )
 
@@ -161,7 +160,7 @@ def process_open_answer_dataset(
 
     # --- 2. Assistant body --------------------------------------------------
     assistant_body = _ASSISTANT_BODY_TMPL.render(
-        explanation=row.get("explanation", ""),  # Optional explanation
+        # explanation=row.get("explanation", ""),  # Optional explanation
         answer_text=row["answer"],
     )
 

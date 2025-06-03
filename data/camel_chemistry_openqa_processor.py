@@ -39,7 +39,7 @@ class OpenAnswerProcessor(BaseOpenQAProcessor):
         for item in raw_data:
             question = item.get("problem", "")
             solution = item.get("deepseek_solution", "")
-            explanation = item.get("reasoning", "")
+            # explanation = item.get("reasoning", "")
 
             # if not question or not isinstance(solutions, list) or not solutions:
             #     continue
