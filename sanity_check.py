@@ -43,8 +43,69 @@ MODEL_NAME = "Qwen/Qwen3-0.6B"  # Using available model
 DATASET_NAME = "RikoteMaster/sanity_check_dataset"
 MAX_LENGTH = 2048
 EPOCHS = 5
+EPOCHS = 5
 HF_TOKEN = ""
 REPO_NAME = "RikoteMaster/sanity_check_model"
+
+# Define LETTER_INDICES for consistent choice formatting
+LETTER_INDICES = "ABCD"
+
+# Content for the system message in our MMLU template
+MMLU_SYSTEM_MESSAGE_CONTENT = "The following are multiple choice questions (with answers) about knowledge and skills in advanced master-level STEM courses.\nJust answer with A, B, C, or D."
+
+# Custom MMLU chat template
+# This template assumes messages will have:
+# 1. An optional "system" message (we'll use MMLU_SYSTEM_MESSAGE_CONTENT)
+# 2. A "user" message with the formatted question and "Answer:"
+# And will add the assistant prompt
+MY_MMLU_CHAT_TEMPLATE_JINJA = (
+    "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+            "{{ '<|im_start|>system\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% elif message['role'] == 'user' %}"
+            "{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% elif message['role'] == 'assistant' %}"  # For completion during training
+            "{{ '<|im_start|>assistant\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}"  # SFTTrainer/lighteval will use this for assistant turn start
+        "{{ '<|im_start|>assistant\n' }}"
+    "{% endif %}"
+)
+
+def format_mmlu_prompt(question: str, choices: list[str], tokenizer) -> str:
+    """Format prompt using our custom MMLU chat template.
+    
+    This matches the format used in lighteval's MCQATask with loglikelihood_acc_norm,
+    using our custom MMLU chat template instead of Qwen3's default.
+    """
+    # Format choices as A. choice1\nB. choice2\n...
+    choices_str = "\n".join(f"{LETTER_INDICES[i]}. {choice}" for i, choice in enumerate(choices))
+    
+    # Content for the user message
+    # Note: We don't include the system message content here as it's handled by the template
+    user_content = f"{question}\n{choices_str}\nAnswer:"
+    
+    # Create messages list for our custom template
+    messages = [
+        {"role": "system", "content": MMLU_SYSTEM_MESSAGE_CONTENT},
+        {"role": "user", "content": user_content.strip()}
+    ]
+    
+    # Apply our custom MMLU chat template
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+def format_mmlu_target(answer_index: int) -> str:
+    """Format target exactly as lighteval expects for loglikelihood calculation.
+    
+    This matches how lighteval constructs the continuation for loglikelihood calculation.
+    The space before the letter is crucial for tokenization alignment.
+    """
+    return f" {chr(65 + answer_index)}"  # Note the space before the letter
 
 # Define LETTER_INDICES for consistent choice formatting
 LETTER_INDICES = "ABCD"
