@@ -35,9 +35,10 @@ os.environ["HF_DATASETS_CACHE"] = str(HF_CACHE_DIR / "datasets")
 
 # Third-party imports
 from datasets import load_dataset, Dataset
-from transformers import TrainingArguments, Trainer
+from transformers import TrainingArguments, Trainer, AutoTokenizer, AutoModelForCausalLM
 from dotenv import load_dotenv
 from torch.utils.data import DataLoader
+from trl import DataCollatorForCompletionOnlyLM
 
 # Local imports
 from utils.dataset_utils import (
@@ -45,6 +46,9 @@ from utils.dataset_utils import (
     SFTDataCollator,
     process_open_answer_dataset,
     process_mcq_dataset,
+    MMLU_CHAT_TEMPLATE_JINJA,
+    format_mmlu_prompt,
+    format_mmlu_target,
 )
 from utils.model_utils import load_model
 from utils.train_utils import plot_training_loss
@@ -110,16 +114,70 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # 1. Model and Tokenizer Setup
+    # 1. Model and Tokenizer Setup - ADAPTED FROM sanity_check.py
     logger.info("Loading model and tokenizer...")
-    model, tokenizer = load_model(
-        model_name=args.model_name, load_in_4bit=False
-    )
+    
+    # Load tokenizer first
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Log original chat template
+    logger.info("Original chat template (from Qwen3 default):")
+    logger.info(tokenizer.chat_template)
+    
+    # Set custom MMLU chat template
+    logger.info("Setting custom MMLU chat template...")
+    tokenizer.chat_template = MMLU_CHAT_TEMPLATE_JINJA
+    logger.info("Custom MMLU chat template:")
+    logger.info(tokenizer.chat_template)
+
+    # Load model
+    model, _ = load_model(model_name=args.model_name, load_in_4bit=False)
     logger.info("Model and tokenizer loaded successfully")
+
+    # Determine response template for DataCollatorForCompletionOnlyLM
+    logger.info("Determining response template for data collator...")
+    try:
+        # Try to get response template programmatically using our custom template
+        dummy_messages = [
+            {"role": "system", "content": "System test"},
+            {"role": "user", "content": "User test"}
+        ]
+        prompt_with_gen = tokenizer.apply_chat_template(
+            dummy_messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        prompt_without_gen = tokenizer.apply_chat_template(
+            dummy_messages,
+            tokenize=False,
+            add_generation_prompt=False
+        )
+        response_template_str = prompt_with_gen[len(prompt_without_gen):]
+        
+        if not response_template_str.strip():
+            raise ValueError("Empty response template")
+            
+        # Verify the response template matches what we expect
+        logger.info(f"Response template string: '{response_template_str}'")
+        logger.info(f"Response template tokens: {tokenizer.encode(response_template_str, add_special_tokens=False)}")
+            
+    except Exception as e:
+        logger.warning(f"Could not determine response template programmatically: {e}")
+        # Fallback to known template
+        response_template_str = "<|im_start|>assistant\n"
+        logger.warning(f"Using fallback response template: '{response_template_str}'")
+    
+    logger.info(f"Using response template: '{response_template_str}'")
+    response_template_ids = tokenizer.encode(response_template_str, add_special_tokens=False)
+    
+    if not response_template_ids:
+        raise ValueError(f"Response template '{response_template_str}' encoded to empty IDs")
 
     # 2. Dataset Preparation - UNIFIED WITH main_lora.py
     logger.info("Loading dataset...")
-    dataset = load_dataset(args.dataset)["test"]
+    dataset = load_dataset(args.dataset)["train"]  # Use train split instead of test
     dataset = dataset.shuffle(seed=42)
 
     # Limit number of samples if specified
@@ -135,15 +193,39 @@ def main():
     logger.info(f"Training set size: {len(train_dataset)} samples")
     logger.info(f"Validation set size: {len(val_dataset)} samples")
 
-    # Process dataset based on type
-    logger.info("Processing dataset...")
+    # Process dataset using MMLU formatting
+    logger.info("Processing dataset with MMLU format...")
+    
+    # Formatting function that uses our custom MMLU template
+    def formatting_func(example):
+        """Format example using our custom MMLU template."""
+        # Format prompt using our custom template
+        prompt = format_mmlu_prompt(example["question"], example["choices"], tokenizer)
+        
+        # Format target exactly as lighteval expects for loglikelihood
+        target = format_mmlu_target(example["answer_index"])
+        
+        # Combine prompt and target for training
+        full_text = prompt + target
+        
+        # Calculate prompt length for masking (like other dataset functions)
+        prompt_len = len(tokenizer(prompt)["input_ids"])
+        
+        return {
+            "text": full_text,
+            "prompt": prompt,
+            "prompt_len": prompt_len
+        }
+
     is_mcqa = "choices" in train_dataset.column_names
     if is_mcqa:
-        logger.info("Processing MCQA dataset...")
-        train_dataset = train_dataset.map(process_mcq_dataset)
+        logger.info("Processing MCQA dataset with MMLU format...")
+        train_dataset = train_dataset.map(formatting_func)
+        val_dataset = val_dataset.map(formatting_func)
     else:
         logger.info("Processing OpenAnswer dataset...")
         train_dataset = train_dataset.map(process_open_answer_dataset)
+        val_dataset = val_dataset.map(process_open_answer_dataset)
 
     # Print first 5 samples showing just the text field
     logger.info("\nFirst 5 text samples:")
@@ -165,11 +247,6 @@ def main():
     # Process validation dataset if available
     tokenized_val_dataset = None
     if val_dataset is not None:
-        if is_mcqa:
-            val_dataset = val_dataset.map(process_mcq_dataset)
-        else:
-            val_dataset = val_dataset.map(process_open_answer_dataset)
-        
         tokenized_val_dataset = val_dataset.map(
             tokenize_func,
             fn_kwargs={"tokenizer": tokenizer},
@@ -194,7 +271,11 @@ def main():
     tokenized_train_dataset = tokenized_train_dataset.sort("length", reverse=True)
 
     # 3. Training Setup
-    data_collator = SFTDataCollator(tokenizer=tokenizer)
+    # Use DataCollatorForCompletionOnlyLM instead of SFTDataCollator
+    data_collator = DataCollatorForCompletionOnlyLM(
+        response_template=response_template_ids,
+        tokenizer=tokenizer
+    )
 
     # Set up token-budget batching
     max_tok_per_gpu = 8_000  # fits comfortably in 24 GB with bf16
@@ -307,7 +388,7 @@ def main():
             logger.info(f"Successfully set up evaluation dataloader with {len(tokenized_val_dataset)} examples")
         else:
             logger.info("No validation dataset available")
-            
+        
     except Exception as e:
         logger.warning(f"Could not set up evaluation dataloader: {str(e)}")
         logger.warning("Training will proceed without evaluation")
@@ -346,7 +427,7 @@ def main():
         gradient_checkpointing=True,
         max_grad_norm=1.0,
         warmup_steps=1,
-        learning_rate=2e-4,
+        learning_rate=6e-4,  # Match sanity_check.py
         optim="adamw_torch",
         lr_scheduler_type="cosine",
         dataloader_pin_memory=False,
@@ -370,7 +451,7 @@ def main():
             if self.custom_train_dataloader is not None:
                 return self.custom_train_dataloader
             return super().get_train_dataloader()
-        
+            
         def get_eval_dataloader(self, eval_dataset=None):
             if self.custom_eval_dataloader is not None:
                 return self.custom_eval_dataloader
@@ -460,7 +541,17 @@ def main():
     # === SAVE MODEL ===
     logger.info("Saving model...")
     model.save_pretrained(OUTPUT_DIR)
+    
+    # Save tokenizer with custom template
+    logger.info("Saving tokenizer with custom MMLU template...")
     tokenizer.save_pretrained(OUTPUT_DIR)
+    
+    # Verify saved chat template
+    logger.info("Verifying saved chat template...")
+    saved_tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR, trust_remote_code=True)
+    logger.info("Chat template from saved tokenizer (should be custom MMLU):")
+    logger.info(saved_tokenizer.chat_template)
+    
     logger.info("INFO: Model saved successfully!")
 
     # === PUSH TO HUB ===
@@ -482,7 +573,7 @@ def main():
             logger.error(f"ERROR: Failed to push model to HuggingFace: {e}")
     else:
         logger.warning("WARNING: No HF_TOKEN found, skipping HuggingFace push")
-
+    
     # Clear GPU cache
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

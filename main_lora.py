@@ -41,9 +41,13 @@ from transformers import (
     DataCollatorForLanguageModeling,
 )
 from peft import LoraConfig, get_peft_model, TaskType
+from trl import DataCollatorForCompletionOnlyLM
 from utils.dataset_utils import (
     process_mcq_dataset,
     SFTDataCollator,
+    MMLU_CHAT_TEMPLATE_JINJA,
+    format_mmlu_prompt,
+    format_mmlu_target,
 )  # <-- import your ChatML logic here
 from transformers.utils import CONFIG_NAME
 
@@ -85,14 +89,13 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # === LOAD DATASET ===
 logger.info("Loading dataset...")
-dataset = load_dataset(DATASET_NAME)["test"]
+dataset = load_dataset(DATASET_NAME)["train"]  # Use train split instead of test
 dataset = dataset.shuffle(seed=42)
 
 # Limit number of samples if specified
 if args.num_samples is not None:
     logger.info(f"Limiting dataset to {args.num_samples} samples")
     dataset = dataset.select(range(min(args.num_samples, len(dataset))))
-    dataset = dataset["test"]
 
 split = dataset.train_test_split(test_size=0.1, seed=42)
 train_dataset = split["train"]
@@ -116,6 +119,16 @@ bnb_config = BitsAndBytesConfig(
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME, trust_remote_code=True)
 tokenizer.pad_token = tokenizer.eos_token
 
+# Log original chat template
+logger.info("Original chat template (from Qwen3 default):")
+logger.info(tokenizer.chat_template)
+
+# Set custom MMLU chat template
+logger.info("Setting custom MMLU chat template...")
+tokenizer.chat_template = MMLU_CHAT_TEMPLATE_JINJA
+logger.info("Custom MMLU chat template:")
+logger.info(tokenizer.chat_template)
+
 #  Load fine-tuned model weights
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
@@ -123,6 +136,45 @@ model = AutoModelForCausalLM.from_pretrained(
     trust_remote_code=True,
     quantization_config=bnb_config,
 )
+
+# Determine response template for DataCollatorForCompletionOnlyLM
+logger.info("Determining response template for data collator...")
+try:
+    # Try to get response template programmatically using our custom template
+    dummy_messages = [
+        {"role": "system", "content": "System test"},
+        {"role": "user", "content": "User test"}
+    ]
+    prompt_with_gen = tokenizer.apply_chat_template(
+        dummy_messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    prompt_without_gen = tokenizer.apply_chat_template(
+        dummy_messages,
+        tokenize=False,
+        add_generation_prompt=False
+    )
+    response_template_str = prompt_with_gen[len(prompt_without_gen):]
+    
+    if not response_template_str.strip():
+        raise ValueError("Empty response template")
+        
+    # Verify the response template matches what we expect
+    logger.info(f"Response template string: '{response_template_str}'")
+    logger.info(f"Response template tokens: {tokenizer.encode(response_template_str, add_special_tokens=False)}")
+        
+except Exception as e:
+    logger.warning(f"Could not determine response template programmatically: {e}")
+    # Fallback to known template
+    response_template_str = "<|im_start|>assistant\n"
+    logger.warning(f"Using fallback response template: '{response_template_str}'")
+
+logger.info(f"Using response template: '{response_template_str}'")
+response_template_ids = tokenizer.encode(response_template_str, add_special_tokens=False)
+
+if not response_template_ids:
+    raise ValueError(f"Response template '{response_template_str}' encoded to empty IDs")
 
 # === LoRA ===
 logger.info("Applying LoRA...")
@@ -175,8 +227,39 @@ for name, param in model.named_parameters():
 # === PREPROCESS ===
 logger.info("Preprocessing...")
 
-train_dataset = train_dataset.map(process_mcq_dataset)
-val_dataset = val_dataset.map(process_mcq_dataset)
+# Process dataset using MMLU formatting
+logger.info("Processing dataset with MMLU format...")
+
+# Formatting function that uses our custom MMLU template
+def formatting_func(example):
+    """Format example using our custom MMLU template."""
+    # Format prompt using our custom template
+    prompt = format_mmlu_prompt(example["question"], example["choices"], tokenizer)
+    
+    # Format target exactly as lighteval expects for loglikelihood
+    target = format_mmlu_target(example["answer_index"])
+    
+    # Combine prompt and target for training
+    full_text = prompt + target
+    
+    # Calculate prompt length for masking (like other dataset functions)
+    prompt_len = len(tokenizer(prompt)["input_ids"])
+    
+    return {
+        "text": full_text,
+        "prompt": prompt,
+        "prompt_len": prompt_len
+    }
+
+is_mcqa = "choices" in train_dataset.column_names
+if is_mcqa:
+    logger.info("Processing MCQA dataset with MMLU format...")
+    train_dataset = train_dataset.map(formatting_func)
+    val_dataset = val_dataset.map(formatting_func)
+else:
+    logger.info("Processing dataset with standard format...")
+    train_dataset = train_dataset.map(process_mcq_dataset)
+    val_dataset = val_dataset.map(process_mcq_dataset)
 
 tokenized_train_dataset = train_dataset.map(
     tokenize_func,
@@ -202,14 +285,11 @@ tokenized_eval_dataset = tokenized_val_dataset.map(
 tokenized_train_dataset = tokenized_train_dataset.sort("length", reverse=True)
 
 # 3. Training Setup
-data_collator = SFTDataCollator(tokenizer=tokenizer)
-
-# ALTERNATIVE: If loss is still 0, try using the standard data collator
-# data_collator = DataCollatorForLanguageModeling(
-#     tokenizer=tokenizer,
-#     mlm=False,  # We're doing causal LM, not masked LM
-#     pad_to_multiple_of=None,
-# )
+# Use DataCollatorForCompletionOnlyLM instead of SFTDataCollator
+data_collator = DataCollatorForCompletionOnlyLM(
+    response_template=response_template_ids,
+    tokenizer=tokenizer
+)
 
 # Set up token-budget batching
 max_tok_per_gpu = 8_000  # fits comfortably in 24 GB with bf16
@@ -358,7 +438,7 @@ training_args = TrainingArguments(
     gradient_checkpointing=True,
     max_grad_norm=1.0,
     warmup_steps=1,
-    learning_rate=2e-4,
+    learning_rate=6e-4,  # Match sanity_check.py
     optim="adamw_torch",
     lr_scheduler_type="cosine",
     dataloader_pin_memory=False,
@@ -474,7 +554,16 @@ logger.info("Saving LoRA adapters locally...")
 
 # Save LoRA adapters (for potential future use)
 model.save_pretrained(OUTPUT_DIR, safe_serialization=True)
+
+# Save tokenizer with custom template
+logger.info("Saving tokenizer with custom MMLU template...")
 tokenizer.save_pretrained(OUTPUT_DIR)
+
+# Verify saved chat template
+logger.info("Verifying saved chat template...")
+saved_tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR, trust_remote_code=True)
+logger.info("Chat template from saved tokenizer (should be custom MMLU):")
+logger.info(saved_tokenizer.chat_template)
 
 logger.info("INFO: Saving LoRA adapters in separate directory...")
 # Save LoRA adapters in a separate directory for backup
@@ -550,12 +639,13 @@ else:
 logger.info("INFO: Creating README with usage instructions...")
 readme_content = f"""# {args.output_name}
 
-This is a LoRA (Low-Rank Adaptation) model fine-tuned for MCQA tasks.
+This is a LoRA (Low-Rank Adaptation) model fine-tuned for MCQA tasks with custom MMLU formatting.
 
 ## Base Model
 - **Base Model**: `{MODEL_NAME}`
 - **LoRA Rank**: 8
 - **Target Modules**: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
+- **Chat Template**: Custom MMLU chat template for consistent formatting
 
 ## Usage
 
@@ -591,10 +681,11 @@ tokenizer = AutoTokenizer.from_pretrained("{HF_REPO_ID}")
 - **Training Dataset**: {DATASET_NAME}
 - **Fine-tuning Method**: LoRA
 - **Task**: Multiple Choice Question Answering (MCQA)
+- **Training Format**: Exact MMLU format for loglikelihood_acc_norm evaluation
 
 ## Dependencies
 ```bash
-pip install transformers peft torch
+pip install transformers peft torch trl
 ```
 """
 

@@ -17,6 +17,36 @@ from torch.nn.utils.rnn import pad_sequence
 
 
 # ---------------------------------------------------------------------------
+# Constants and Templates
+# ---------------------------------------------------------------------------
+
+# Define LETTER_INDICES for consistent choice formatting - expanded to support more choices
+LETTER_INDICES = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"  # Support up to 26 choices
+
+# Content for the system message in our MMLU template
+MMLU_SYSTEM_MESSAGE_CONTENT = "The following are multiple choice questions (with answers) about knowledge and skills in advanced master-level STEM courses.\nJust answer with A, B, C, or D."
+
+# Custom MMLU chat template
+# This template assumes messages will have:
+# 1. An optional "system" message (we'll use MMLU_SYSTEM_MESSAGE_CONTENT)
+# 2. A "user" message with the formatted question and "Answer:"
+# And will add the assistant prompt
+MMLU_CHAT_TEMPLATE_JINJA = (
+    "{% for message in messages %}"
+        "{% if message['role'] == 'system' %}"
+            "{{ '<|im_start|>system\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% elif message['role'] == 'user' %}"
+            "{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% elif message['role'] == 'assistant' %}"  # For completion during training
+            "{{ '<|im_start|>assistant\n' + message['content'] + '<|im_end|>\n' }}"
+        "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}"  # SFTTrainer/lighteval will use this for assistant turn start
+        "{{ '<|im_start|>assistant\n' }}"
+    "{% endif %}"
+)
+
+# ---------------------------------------------------------------------------
 # Jinja template blocks
 # ---------------------------------------------------------------------------
 
@@ -76,6 +106,56 @@ _ASSISTANT_BODY_TMPL = Template(
 )
 
 _ASSISTANT_END = "\n<|im_end|>"
+
+# ---------------------------------------------------------------------------
+# MMLU Formatting Functions
+# ---------------------------------------------------------------------------
+
+def format_mmlu_prompt(question: str, choices: list[str], tokenizer) -> str:
+    """Format prompt using our custom MMLU chat template.
+    
+    This matches the format used in lighteval's MCQATask with loglikelihood_acc_norm,
+    using our custom MMLU chat template instead of Qwen3's default.
+    """
+    # Ensure choices is a list
+    if not isinstance(choices, (list, tuple)):
+        raise ValueError(f"Expected choices to be a list or tuple, got {type(choices)}")
+    
+    # Check if we have too many choices
+    if len(choices) > len(LETTER_INDICES):
+        raise ValueError(f"Too many choices ({len(choices)}). Maximum supported: {len(LETTER_INDICES)}")
+    
+    # Format choices as A. choice1\nB. choice2\n...
+    choices_str = "\n".join(f"{LETTER_INDICES[i]}. {choice}" for i, choice in enumerate(choices))
+    
+    # Content for the user message
+    # Note: We don't include the system message content here as it's handled by the template
+    user_content = f"{question}\n{choices_str}\nAnswer:"
+    
+    # Create messages list for our custom template
+    messages = [
+        {"role": "system", "content": MMLU_SYSTEM_MESSAGE_CONTENT},
+        {"role": "user", "content": user_content.strip()}
+    ]
+    
+    # Apply our custom MMLU chat template
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+def format_mmlu_target(answer_index: int) -> str:
+    """Format target exactly as lighteval expects for loglikelihood calculation.
+    
+    This matches how lighteval constructs the continuation for loglikelihood calculation.
+    The space before the letter is crucial for tokenization alignment.
+    """
+    # Check if answer_index is valid
+    if answer_index >= len(LETTER_INDICES):
+        raise ValueError(f"Invalid answer_index ({answer_index}). Maximum supported: {len(LETTER_INDICES)-1}")
+    
+    return f" {LETTER_INDICES[answer_index]}"  # Note the space before the letter
 
 # ---------------------------------------------------------------------------
 # Public helpers
