@@ -6,6 +6,8 @@ import torch
 import argparse
 import tempfile
 import shutil
+import pandas as pd
+import matplotlib.pyplot as plt
 
 # Get the directory where this script is located
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -14,43 +16,19 @@ PROJECT_ROOT = SCRIPT_DIR  # Assuming the script is in the project root
 # Set up project directories relative to script location
 RESULTS_DIR = PROJECT_ROOT / "results_model"
 FIGS_DIR = RESULTS_DIR / "figs"
-HF_CACHE_HOME_DIR = RESULTS_DIR / "hf_cache"
+HF_CACHE_DIR = RESULTS_DIR / "hf_cache"  # Persistent cache directory
 
 # Create necessary directories
 RESULTS_DIR.mkdir(exist_ok=True)
 FIGS_DIR.mkdir(exist_ok=True)
+HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 print(f"Script location: {SCRIPT_DIR}")
 print(f"Project root: {PROJECT_ROOT}")
 print(f"Results directory: {RESULTS_DIR}")
+print(f"HF Cache directory: {HF_CACHE_DIR}")
 
-# Set HuggingFace cache directory to faster location
-# Try /tmp first (usually faster), fallback to project location
-
-# Check available space in /tmp
-def get_free_space_gb(path):
-    """Get free space in GB for a given path"""
-    try:
-        statvfs = os.statvfs(path)
-        return (statvfs.f_frsize * statvfs.f_bavail) / (1024**3)
-    except (OSError, AttributeError):
-        return 0
-
-tmp_space = get_free_space_gb("/tmp")
-home_space = get_free_space_gb(str(RESULTS_DIR))
-
-print(f"Available space in /tmp: {tmp_space:.1f} GB")
-print(f"Available space in project results: {home_space:.1f} GB")
-
-# Use /tmp if it has at least 50GB free, otherwise use project directory
-if tmp_space > 50:
-    HF_CACHE_DIR = Path("/tmp") / f"hf_cache_ricoiban_{os.getpid()}"
-    print(f"Using faster cache location: {HF_CACHE_DIR}")
-else:
-    HF_CACHE_DIR = HF_CACHE_HOME_DIR
-    print(f"Using project cache location: {HF_CACHE_DIR}")
-
-HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# Set HuggingFace cache directory to project location
 os.environ["HF_HOME"] = str(HF_CACHE_DIR)
 os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_DIR / "transformers")
 os.environ["HF_DATASETS_CACHE"] = str(HF_CACHE_DIR / "datasets")
@@ -81,36 +59,11 @@ from utils.batching import SmartPaddingTokenBatchSampler
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train and evaluate a language model")
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="RikoteMaster/OpenQA_merged",
-        help="Dataset to use for training (default: RikoteMaster/OpenQA_merged)",
-    )
-    parser.add_argument(
-        "--output_name",
-        type=str,
-        default="Qwen3-0.6B-SFT-aux",
-        help="Name for output directory and HuggingFace push (default: Qwen3-0.6B-SFT-MCQA)",
-    )
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=None,
-        help="Number of training samples to use (default: use full dataset)",
-    )
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="Qwen/Qwen3-0.6B",
-        help="Name of the model to load from HuggingFace (default: Qwen/Qwen3-0.6B)",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=1,
-        help="Number of epochs to train for (default: 1)",
-    )
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B", help="Model name")
+    parser.add_argument("--output_name", type=str, default="Qwen3-0.6B-SFT-aux", help="Output dir/repo name")
+    parser.add_argument("--dataset", type=str, default="RikoteMaster/OpenQA_merged", help="Dataset to use")
+    parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
+    parser.add_argument("--num_samples", type=int, default=None, help="Number of samples to use")
     return parser.parse_args()
 
 
@@ -164,68 +117,81 @@ def main():
     )
     logger.info("Model and tokenizer loaded successfully")
 
-    # 2. Dataset Preparation with streaming and strict memory limits
-    logger.info("Loading dataset from HuggingFace with streaming...")
-    streaming_dataset = load_dataset(args.dataset, split="train", streaming=True)
+    # 2. Dataset Preparation - UNIFIED WITH main_lora.py
+    logger.info("Loading dataset...")
+    dataset = load_dataset(args.dataset)["test"]
+    dataset = dataset.shuffle(seed=42)
 
-    # Convert streaming dataset to regular dataset
-    logger.info("Converting dataset...")
-    train_dataset = []
-    for i, example in enumerate(streaming_dataset):
-        if args.num_samples is not None and i >= args.num_samples:
-            break
-        train_dataset.append(example)
-    train_dataset = Dataset.from_list(train_dataset)
-    logger.info(f"Processing {len(train_dataset)} examples")
+    # Limit number of samples if specified
+    if args.num_samples is not None:
+        logger.info(f"Limiting dataset to {args.num_samples} samples")
+        dataset = dataset.select(range(min(args.num_samples, len(dataset))))
 
-    # Process with memory-efficient mapping
+    split = dataset.train_test_split(test_size=0.1, seed=42)
+    train_dataset = split["train"]
+    val_dataset = split["test"]
+
+    logger.info(f"Dataset size: {len(dataset)} samples")
+    logger.info(f"Training set size: {len(train_dataset)} samples")
+    logger.info(f"Validation set size: {len(val_dataset)} samples")
+
+    # Process dataset based on type
     logger.info("Processing dataset...")
     is_mcqa = "choices" in train_dataset.column_names
     if is_mcqa:
         logger.info("Processing MCQA dataset...")
-        train_dataset = train_dataset.map(
-            process_mcq_dataset,
-            fn_kwargs={"tokenizer": tokenizer},
-            batch_size=1,  # Process one at a time
-            remove_columns=train_dataset.column_names,
-        )
+        train_dataset = train_dataset.map(process_mcq_dataset)
     else:
         logger.info("Processing OpenAnswer dataset...")
-        train_dataset = train_dataset.map(
-            process_open_answer_dataset,
-            fn_kwargs={"tokenizer": tokenizer},
-            batch_size=1,  # Process one at a time
-            remove_columns=train_dataset.column_names,
-        )
+        train_dataset = train_dataset.map(process_open_answer_dataset)
+
     # Print first 5 samples showing just the text field
     logger.info("\nFirst 5 text samples:")
     for i in range(5):
         logger.info(f"\n{'='*80}")
         logger.info(f"SAMPLE {i+1}")
         logger.info(f"{'='*80}")
-        # Access text directly from the dataset's text column
         text = train_dataset["text"][i]
         logger.info(text)
         logger.info(f"{'-'*80}")
 
     logger.info("Tokenizing dataset...")
-    tokenized_dataset = train_dataset.map(
+    tokenized_train_dataset = train_dataset.map(
         tokenize_func,
-        fn_kwargs={"tokenizer": tokenizer},  # Shorter sequences
-        batch_size=1,  # Process one at a time
+        fn_kwargs={"tokenizer": tokenizer},
         remove_columns=train_dataset.column_names,
     )
 
+    # Process validation dataset if available
+    tokenized_val_dataset = None
+    if val_dataset is not None:
+        if is_mcqa:
+            val_dataset = val_dataset.map(process_mcq_dataset)
+        else:
+            val_dataset = val_dataset.map(process_open_answer_dataset)
+        
+        tokenized_val_dataset = val_dataset.map(
+            tokenize_func,
+            fn_kwargs={"tokenizer": tokenizer},
+            remove_columns=val_dataset.column_names,
+        )
+
     # Add sequence lengths to dataset
     logger.info("Computing sequence lengths...")
-    tokenized_dataset = tokenized_dataset.map(
+    tokenized_train_dataset = tokenized_train_dataset.map(
         lambda ex: {"length": len(ex["input_ids"])},
-        num_proc=4,  # speeds it up
+        num_proc=4,
     )
+
+    if tokenized_val_dataset is not None:
+        tokenized_val_dataset = tokenized_val_dataset.map(
+            lambda ex: {"length": len(ex["input_ids"])},
+            num_proc=4,
+        )
 
     # Sort dataset by length
     logger.info("Sorting dataset by sequence length...")
-    tokenized_dataset = tokenized_dataset.sort("length", reverse=True)
+    tokenized_train_dataset = tokenized_train_dataset.sort("length", reverse=True)
 
     # 3. Training Setup
     data_collator = SFTDataCollator(tokenizer=tokenizer)
@@ -233,18 +199,18 @@ def main():
     # Set up token-budget batching
     max_tok_per_gpu = 8_000  # fits comfortably in 24 GB with bf16
     sampler = SmartPaddingTokenBatchSampler(
-        tokenized_dataset["length"], max_tok_per_gpu
+        tokenized_train_dataset["length"], max_tok_per_gpu
     )
 
     logger.info("INFO: Smart Batching Info:")
     logger.info(f"  - Max tokens per GPU: {max_tok_per_gpu}")
-    logger.info(f"  - Dataset length: {len(tokenized_dataset)}")
+    logger.info(f"  - Dataset length: {len(tokenized_train_dataset)}")
 
     # Debug: Count total batches that will be created - do this properly
     batch_count = 0
     sample_batch_sizes = []
     temp_sampler = SmartPaddingTokenBatchSampler(
-        tokenized_dataset["length"], max_tok_per_gpu
+        tokenized_train_dataset["length"], max_tok_per_gpu
     )
 
     # Count ALL batches that will actually be generated
@@ -253,7 +219,7 @@ def main():
         batch_count += 1
         sample_batch_sizes.append(len(batch_indices))
         if batch_count <= 5:  # Show first 5 batch sizes
-            max_len = max([tokenized_dataset[i]["length"] for i in batch_indices])
+            max_len = max([tokenized_train_dataset[i]["length"] for i in batch_indices])
             logger.info(f"  - Batch {batch_count}: {len(batch_indices)} samples, max_len: {max_len}")
 
     logger.info(f"  - Total ACTUAL batches: {batch_count}")
@@ -267,7 +233,7 @@ def main():
 
     # Create fresh sampler for actual training
     sampler = SmartPaddingTokenBatchSampler(
-        tokenized_dataset["length"], max_tok_per_gpu
+        tokenized_train_dataset["length"], max_tok_per_gpu
     )
 
     # Create custom dataloader with correct length reporting
@@ -282,7 +248,7 @@ def main():
 
     dl = CustomDataLoader(
         batch_count,  # Pass the actual batch count
-        tokenized_dataset,
+        tokenized_train_dataset,
         batch_sampler=sampler,
         collate_fn=data_collator,
         num_workers=0,  # or >0 if RAM allows
@@ -321,104 +287,78 @@ def main():
     # Try to set up evaluation dataloader
     eval_dl = None
     try:
-        logger.info("Attempting to load evaluation dataset...")
-        eval_dataset = load_dataset(args.dataset, split="validation", streaming=True)
-        
-        # Convert streaming dataset to regular dataset
-        eval_dataset_list = []
-        for example in eval_dataset:
-            eval_dataset_list.append(example)
-        eval_dataset = Dataset.from_list(eval_dataset_list)
-        
-        # Process evaluation dataset
-        if is_mcqa:
-            eval_dataset = eval_dataset.map(
-                process_mcq_dataset,
-                fn_kwargs={"tokenizer": tokenizer},
-                batch_size=1,
-                remove_columns=eval_dataset.column_names,
+        if tokenized_val_dataset is not None:
+            logger.info("Setting up evaluation dataloader...")
+            # Create evaluation sampler
+            eval_sampler = SmartPaddingTokenBatchSampler(
+                tokenized_val_dataset["length"], max_tok_per_gpu
             )
+            
+            # Create evaluation dataloader
+            eval_dl = CustomDataLoader(
+                len(eval_sampler),
+                tokenized_val_dataset,
+                batch_sampler=eval_sampler,
+                collate_fn=data_collator,
+                num_workers=0,
+                pin_memory=False,
+            )
+            
+            logger.info(f"Successfully set up evaluation dataloader with {len(tokenized_val_dataset)} examples")
         else:
-            eval_dataset = eval_dataset.map(
-                process_open_answer_dataset,
-                fn_kwargs={"tokenizer": tokenizer},
-                batch_size=1,
-                remove_columns=eval_dataset.column_names,
-            )
-        
-        # Tokenize evaluation dataset
-        eval_dataset = eval_dataset.map(
-            tokenize_func,
-            fn_kwargs={"tokenizer": tokenizer},
-            batch_size=1,
-            remove_columns=eval_dataset.column_names,
-        )
-        
-        # Add sequence lengths
-        eval_dataset = eval_dataset.map(
-            lambda ex: {"length": len(ex["input_ids"])},
-            num_proc=4,
-        )
-        
-        # Sort by length
-        eval_dataset = eval_dataset.sort("length", reverse=True)
-        
-        # Create evaluation sampler
-        eval_sampler = SmartPaddingTokenBatchSampler(
-            eval_dataset["length"], max_tok_per_gpu
-        )
-        
-        # Create evaluation dataloader
-        eval_dl = CustomDataLoader(
-            len(eval_sampler),
-            eval_dataset,
-            batch_sampler=eval_sampler,
-            collate_fn=data_collator,
-            num_workers=0,
-            pin_memory=False,
-        )
-        
-        logger.info(f"Successfully loaded evaluation dataset with {len(eval_dataset)} examples")
-        
+            logger.info("No validation dataset available")
+            
     except Exception as e:
-        logger.warning(f"Could not load evaluation dataset: {str(e)}")
+        logger.warning(f"Could not set up evaluation dataloader: {str(e)}")
         logger.warning("Training will proceed without evaluation")
         eval_dl = None
 
     # Calculate expected steps for smart batching
     logger.info("INFO: Dataset info:")
-    logger.info(f"  - Training samples: {len(tokenized_dataset)}")
+    logger.info(f"  - Training samples: {len(tokenized_train_dataset)}")
     logger.info(f"  - Smart batch sampler will create dynamic batches")
     logger.info(f"  - Number of epochs: {args.epochs}")
     logger.info(f"  - Total steps per epoch: {batch_count}")
     logger.info(f"  - Total steps across all epochs: {batch_count * args.epochs}")
 
+    # === TRAINING ARGS ===
+    logger.info("Setting up training...")
+
+    # Create output directory based on output name (same logic as main_lora.py)
+    output_dir = RESULTS_DIR / args.output_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR = str(output_dir)
+
+    logger.info(f"INFO: Output directory: {OUTPUT_DIR}")
+    logger.info(f"INFO: HuggingFace repo: RikoteMaster/{args.output_name}")
+
     training_args = TrainingArguments(
-        output_dir=str(output_dir),  # Use the output_dir directly
-        overwrite_output_dir=True,
-        # Use max_steps with actual batch count * number of epochs
-        max_steps=batch_count * args.epochs,
-        gradient_accumulation_steps=4,  # Increased for stability
-        logging_steps=5,  # More frequent logging for small dataset
-        learning_rate=1e-5,
+        output_dir=OUTPUT_DIR,
+        num_train_epochs=args.epochs,
+        logging_steps=5,
         save_steps=1000,
+        eval_steps=10,  # Evaluate less frequently 
+        eval_strategy="steps" if eval_dl is not None else "no",  # Enable evaluation
         report_to="wandb",
         bf16=True,
         disable_tqdm=False,
         remove_unused_columns=True,
-        gradient_checkpointing=True,  # Enable gradient checkpointing
-        max_grad_norm=1.0,  # Gradient clipping for stability
-        warmup_steps=1,  # Minimal warmup for small dataset
-        # Add evaluation settings
-        eval_strategy="steps" if eval_dl is not None else "no",
-        eval_steps=10 if eval_dl is not None else None,
+        gradient_checkpointing=True,
+        max_grad_norm=1.0,
+        warmup_steps=1,
+        learning_rate=2e-4,
+        optim="adamw_torch",
+        lr_scheduler_type="cosine",
+        dataloader_pin_memory=False,
+        label_names=["labels"],
+        prediction_loss_only=False,
         load_best_model_at_end=True if eval_dl is not None else False,
         metric_for_best_model="eval_loss" if eval_dl is not None else None,
     )
 
-    logger.info("INFO: Training will run for exactly {training_args.max_steps} steps (actual batch count * epochs)")
+    logger.info(f"INFO: Training will run for exactly {training_args.max_steps} steps (actual batch count * {args.epochs} epochs)")
 
-    # Custom Trainer Class
+    # === CUSTOM TRAINER CLASS ===
     class CustomTrainer(Trainer):
         def __init__(self, custom_train_dataloader=None, custom_eval_dataloader=None, expected_steps=None, **kwargs):
             super().__init__(**kwargs)
@@ -430,7 +370,7 @@ def main():
             if self.custom_train_dataloader is not None:
                 return self.custom_train_dataloader
             return super().get_train_dataloader()
-            
+        
         def get_eval_dataloader(self, eval_dataset=None):
             if self.custom_eval_dataloader is not None:
                 return self.custom_eval_dataloader
@@ -440,64 +380,112 @@ def main():
             # Override to prevent Trainer from creating its own sampler
             return None
 
+    # === TRAINER ===
     trainer = CustomTrainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_dataset,  # Set this properly from the start
-        eval_dataset=eval_dataset if eval_dl is not None else None,  # Add evaluation dataset
-        data_collator=data_collator,
+        train_dataset=tokenized_train_dataset,  # Set this properly from the start
+        eval_dataset=tokenized_val_dataset if eval_dl is not None else None,
         tokenizer=tokenizer,
+        data_collator=data_collator,
         custom_train_dataloader=dl,
         custom_eval_dataloader=eval_dl,
         expected_steps=batch_count * args.epochs,
     )
-    # 4. Training
-    logger.info("INFO: Starting training...")
-    logger.info("INFO: Debug Info:")
+
+    # === TRAIN ===
+    logger.info("Starting training...")
+    logger.info(f"INFO: Debug Info:")
     logger.info(f"  - TrainingArguments.max_steps: {training_args.max_steps}")
     logger.info(f"  - Custom dataloader length: {len(dl)}")
     logger.info(f"  - Expected to run {batch_count * args.epochs} steps")
 
     trainer.train()
 
-    logger.info("INFO: Training completed!")
+    logger.info(f"INFO: Training completed!")
     logger.info(f"  - Total steps trained: {trainer.state.global_step}")
     logger.info(f"  - Expected steps: {batch_count * args.epochs}")
 
-    logger.info("INFO: Pushing model and tokenizer to HuggingFace...")
-    if HF_TOKEN:
-        trainer.model.push_to_hub(
-            f"RikoteMaster/{args.output_name}", private=False, token=HF_TOKEN
-        )
-        tokenizer.push_to_hub(
-            f"RikoteMaster/{args.output_name}", private=False, token=HF_TOKEN
-        )
-        logger.info("INFO: Model and tokenizer pushed to HuggingFace successfully")
+    # === SAVE LOGS ===
+    logger.info("Saving training log and plot...")
+
+    # Load training logs
+    log_df = pd.DataFrame(trainer.state.log_history)
+    log_df.to_csv(os.path.join(OUTPUT_DIR, "training_log.csv"), index=False)
+
+    # Plot
+    plt.figure(figsize=(8, 5))
+    plotted = False
+    loss_columns = []
+
+    logger.info(f"INFO: Available log columns: {list(log_df.columns)}")
+
+    if "loss" in log_df.columns:
+        # Filter out NaN values for training loss
+        train_loss_data = log_df.dropna(subset=["loss"])
+        if not train_loss_data.empty:
+            plt.plot(train_loss_data["step"], train_loss_data["loss"], label="Training Loss", marker='o', markersize=2)
+            loss_columns.append("loss")
+            plotted = True
+
+    if "eval_loss" in log_df.columns:
+        # Filter out NaN values for eval loss
+        eval_loss_data = log_df.dropna(subset=["eval_loss"])
+        if not eval_loss_data.empty:
+            plt.plot(eval_loss_data["step"], eval_loss_data["eval_loss"], label="Eval Loss", marker='s', markersize=3)
+            loss_columns.append("eval_loss")
+            plotted = True
+
+    if plotted:
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.title("Training and Evaluation Loss")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # Safe autoscaling - only use columns that exist and have data
+        if loss_columns:
+            available_data = log_df[loss_columns].dropna()
+            if not available_data.empty:
+                min_loss = available_data.min().min()
+                max_loss = available_data.max().max()
+                plt.ylim(bottom=min_loss * 0.95, top=max_loss * 1.05)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, "loss_plot_scaled.png"), dpi=150, bbox_inches='tight')
+        logger.info("INFO: Loss plot saved successfully!")
     else:
-        logger.warning("WARNING: Skipping model and tokenizer push to HuggingFace - no token provided")
-    
-    # Clear GPU cache after training
-    torch.cuda.empty_cache()
+        logger.warning("⚠ No loss data found in logs.")
 
-    # 5. Save model in results_model directory
-    logger.info("INFO: Saving model to results directory: {output_dir}")
-    model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    logger.info("INFO: Model saved to results directory successfully")
+    # === SAVE MODEL ===
+    logger.info("Saving model...")
+    model.save_pretrained(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
+    logger.info("INFO: Model saved successfully!")
 
-    # 6. Plotting and Saving Results
-    logger.info("INFO: Generating and saving training loss plot...")
-    plot_training_loss(trainer, FIGS_DIR)
-    logger.info("INFO: Training loss plot saved successfully")
-
-    # 7. Clean up temporary cache if used
-    if str(HF_CACHE_DIR).startswith("/tmp/"):
-        logger.info("INFO: Cleaning up temporary cache: {HF_CACHE_DIR}")
+    # === PUSH TO HUB ===
+    if HF_TOKEN:
+        logger.info("INFO: Pushing model to HuggingFace...")
         try:
-            shutil.rmtree(HF_CACHE_DIR)
-            logger.info("INFO: Temporary cache cleaned up successfully")
+            model.push_to_hub(
+                f"RikoteMaster/{args.output_name}",
+                token=HF_TOKEN,
+                private=False
+            )
+            tokenizer.push_to_hub(
+                f"RikoteMaster/{args.output_name}",
+                token=HF_TOKEN,
+                private=False
+            )
+            logger.info("INFO: Model pushed to HuggingFace successfully!")
         except Exception as e:
-            logger.warning(f"WARNING: Could not clean up temporary cache: {e}")
+            logger.error(f"ERROR: Failed to push model to HuggingFace: {e}")
+    else:
+        logger.warning("WARNING: No HF_TOKEN found, skipping HuggingFace push")
+
+    # Clear GPU cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     logger.info("INFO: Training pipeline completed successfully")
 

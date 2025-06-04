@@ -39,6 +39,20 @@ Choices:
     lstrip_blocks=True,
 )
 
+# MMLU-specific template
+_MMLU_USER_TMPL = Template(
+    """<|im_start|>user
+The following are multiple choice questions (with answers) about knowledge and skills in advanced master‑level STEM courses.
+Just answer with A, B, C, or D.
+
+{{ question }}
+{{ choices_block }}
+Answer:<|im_end|>
+""",
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+
 _OPEN_ANSWER_TMPL = Template(
     """<|im_start|>user
 The following is a question about knowledge and skills in advanced master‑level STEM courses.
@@ -68,8 +82,12 @@ _ASSISTANT_END = "\n<|im_end|>"
 # ---------------------------------------------------------------------------
 
 
-def build_prompt_section(question: str, choices_block: str) -> str:
+def build_prompt_section(question: str, choices_block: str, use_mmlu: bool = False) -> str:
     """Return the system + user blocks ready for concatenation."""
+    if use_mmlu:
+        return _SYSTEM_BLOCK + _MMLU_USER_TMPL.render(
+            question=question, choices_block=choices_block
+        )
     return _SYSTEM_BLOCK + _USER_TMPL.render(
         question=question, choices_block=choices_block
     )
@@ -79,6 +97,7 @@ def process_mcq_dataset(
     row: Dict[str, str | Sequence[str]],
     *,
     tokenizer=None,
+    use_mmlu: bool = False,
 ) -> Dict[str, str | int | None]:
     """Convert one *row* into the structure required by the training pipeline.
 
@@ -89,6 +108,8 @@ def process_mcq_dataset(
     tokenizer : Pre‑trained tokenizer (optional)
         If supplied, we compute ``prompt_len`` (number of tokens in *prompt*)
         so the collator can create an attention mask faster.
+    use_mmlu : bool
+        If True, uses MMLU-style formatting with letter-only answers.
 
     Returns
     -------
@@ -106,16 +127,26 @@ def process_mcq_dataset(
         choices_block = str(choices_val)
 
     # --- 2. Prompt (system+user+assistant header) ---------------------------
-    prompt = build_prompt_section(row["question"], choices_block) + _ASSISTANT_START
+    prompt = build_prompt_section(row["question"], choices_block, use_mmlu=use_mmlu)
+    
+    if not use_mmlu:
+        prompt += _ASSISTANT_START
 
     # --- 3. Assistant body --------------------------------------------------
-    assistant_body = _ASSISTANT_BODY_TMPL.render(
-        # explanation=row["explanation"],
-        answer_text=row["answer_text"],
-    )
+    if use_mmlu:
+        # For MMLU, just use the letter answer
+        answer_text = chr(65 + row["answer_index"])
+    else:
+        assistant_body = _ASSISTANT_BODY_TMPL.render(
+            answer_text=row["answer_text"],
+        )
+        answer_text = assistant_body
 
     # --- 4. Full text -------------------------------------------------------
-    text = prompt + assistant_body + _ASSISTANT_END
+    if use_mmlu:
+        text = prompt + f" {answer_text}"
+    else:
+        text = prompt + answer_text + _ASSISTANT_END
 
     # --- 5. Prompt length (optional) ---------------------------------------
     if tokenizer is not None:
@@ -126,7 +157,7 @@ def process_mcq_dataset(
     return {
         "prompt": prompt,
         "text": text,
-        "prompt_len": prompt_len,  #
+        "prompt_len": prompt_len,
     }
 
 

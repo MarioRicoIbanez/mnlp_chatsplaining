@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
+import os
 
 import PyPDF2
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -44,16 +45,24 @@ PROJECT_ROOT = SCRIPT_DIR  # Assuming the script is in the project root
 RESULTS_DIR = PROJECT_ROOT / "results_model"
 RAG_DIR = PROJECT_ROOT / "RAG"
 EMBEDDINGS_DIR = RESULTS_DIR / "embeddings"
+HF_CACHE_DIR = RESULTS_DIR / "hf_cache"  # Persistent cache directory
 
 # Create necessary directories
 RESULTS_DIR.mkdir(exist_ok=True)
 RAG_DIR.mkdir(exist_ok=True)
 EMBEDDINGS_DIR.mkdir(exist_ok=True)
+HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 print(f"Script location: {SCRIPT_DIR}")
 print(f"Project root: {PROJECT_ROOT}")
 print(f"RAG directory: {RAG_DIR}")
 print(f"Embeddings directory: {EMBEDDINGS_DIR}")
+print(f"HF Cache directory: {HF_CACHE_DIR}")
+
+# Set HuggingFace cache directory to project location
+os.environ["HF_HOME"] = str(HF_CACHE_DIR)
+os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_DIR / "transformers")
+os.environ["HF_DATASETS_CACHE"] = str(HF_CACHE_DIR / "datasets")
 
 # Load environment variables from .env file (look in script directory first)
 env_file = PROJECT_ROOT / ".env"
@@ -197,29 +206,6 @@ class PDFRAG:
 
         # Store detected RAG directory for later use
         self.rag_dir = detected_rag_dir
-import logging
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger(__name__)
-
-# Get the directory where this script is located
-SCRIPT_DIR = Path(__file__).parent.absolute()
-PROJECT_ROOT = SCRIPT_DIR  # Assuming the script is in the project root
-
-# Set up project directories relative to script location
-RESULTS_DIR = PROJECT_ROOT / "results_model"
-RAG_DIR = PROJECT_ROOT / "RAG"
-EMBEDDINGS_DIR = RESULTS_DIR / "embeddings"
-
-# Create necessary directories
-RESULTS_DIR.mkdir(exist_ok=True)
-RAG_DIR.mkdir(exist_ok=True)
-EMBEDDINGS_DIR.mkdir(exist_ok=True)
 
         # Initialize text splitter with token-based length function
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -1024,6 +1010,7 @@ def main():
     if rag.vector_store is not None:
         logger.info(f"Vector store status: LOADED with {rag.vector_store.index.ntotal} vectors")
         rag.debug_vector_store()  # Add debug analysis
+
 # Load environment variables from .env file (look in script directory first)
 env_file = PROJECT_ROOT / ".env"
 if env_file.exists():

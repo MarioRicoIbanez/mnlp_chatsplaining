@@ -7,6 +7,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import shutil
 import logging
+from torch.utils.data import IterableDataset
 
 # Configure logging
 logging.basicConfig(
@@ -19,10 +20,13 @@ logger = logging.getLogger(__name__)
 # Get the directory where this script is located
 SCRIPT_DIR = Path(__file__).parent.absolute()
 RESULTS_DIR = SCRIPT_DIR / "results_model"
+HF_CACHE_DIR = RESULTS_DIR / "hf_cache"  # Persistent cache directory
 
-# Set HuggingFace cache directory
-HF_CACHE_DIR = RESULTS_DIR / "hf_cache"
+# Create necessary directories
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Set HuggingFace cache directory to project location
 os.environ["HF_HOME"] = str(HF_CACHE_DIR)
 os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_DIR / "transformers")
 os.environ["HF_DATASETS_CACHE"] = str(HF_CACHE_DIR / "datasets")
@@ -53,37 +57,12 @@ import wandb
 load_dotenv()
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train and evaluate a language model with LoRA")
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="RikoteMaster/Qwen3-0.6B-SFT-Open",
-        help="Name of the model to load from HuggingFace (default: RikoteMaster/Qwen3-0.6B-SFT-Open)",
-    )
-    parser.add_argument(
-        "--output_name",
-        type=str,
-        default="MNLP_M2_mcqa_model_chatml",
-        help="Name for output directory and HuggingFace push (default: MNLP_M2_mcqa_model_chatml)",
-    )
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=None,
-        help="Number of training samples to use (default: use full dataset)",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="jonlecumberri/MNLP_M2_mcqa_dataset_processed",
-        help="Dataset to use for training (default: jonlecumberri/MNLP_M2_mcqa_dataset_processed)",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=1,
-        help="Number of epochs to train for (default: 1)",
-    )
+    parser = argparse.ArgumentParser(description="Train and evaluate a language model")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B", help="Model name")
+    parser.add_argument("--output_name", type=str, default="Qwen3-0.6B-SFT-aux", help="Output dir/repo name")
+    parser.add_argument("--dataset", type=str, default="RikoteMaster/OpenQA_merged", help="Dataset to use")
+    parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
+    parser.add_argument("--num_samples", type=int, default=None, help="Number of samples to use")
     return parser.parse_args()
 
 # Parse command line arguments
@@ -93,7 +72,6 @@ args = parse_args()
 HF_TOKEN = os.getenv("HF_TOKEN")
 if not HF_TOKEN:
     logger.warning("HF_TOKEN not found in environment variables. Model pushing will be skipped.")
-HF_TOKEN=""
 
 wandb.init(project="chatsplaining")
 
@@ -107,13 +85,14 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # === LOAD DATASET ===
 logger.info("Loading dataset...")
-dataset = load_dataset(DATASET_NAME)["train"]
+dataset = load_dataset(DATASET_NAME)["test"]
 dataset = dataset.shuffle(seed=42)
 
 # Limit number of samples if specified
 if args.num_samples is not None:
     logger.info(f"Limiting dataset to {args.num_samples} samples")
     dataset = dataset.select(range(min(args.num_samples, len(dataset))))
+    dataset = dataset["test"]
 
 split = dataset.train_test_split(test_size=0.1, seed=42)
 train_dataset = split["train"]
@@ -367,9 +346,7 @@ logger.info(f"INFO: HuggingFace repo: {HF_REPO_ID}")
 
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
-    # Use max_steps with actual batch count - this ensures we train on ALL data
-    max_steps=batch_count * args.epochs,  # Multiply by number of epochs
-    gradient_accumulation_steps=1,  # Temporarily disable to debug
+    num_train_epochs=args.epochs,
     logging_steps=5,
     save_steps=1000,
     eval_steps=10,  # Evaluate less frequently 
@@ -676,3 +653,16 @@ except Exception as e:
     logger.info(f"   tokenizer = AutoTokenizer.from_pretrained('{OUTPUT_DIR}')")
 
 logger.info("INFO: Done.")
+
+class CustomBatchIterableDataset(IterableDataset):
+    def __init__(self, dataset, sampler):
+        self.dataset = dataset
+        self.sampler = sampler
+
+    def __iter__(self):
+        for batch_indices in self.sampler:
+            batch = [self.dataset[i] for i in batch_indices]
+            yield batch
+
+# Usage:
+train_iterable_dataset = CustomBatchIterableDataset(tokenized_train_dataset, sampler)
